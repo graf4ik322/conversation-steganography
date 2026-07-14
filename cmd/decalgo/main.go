@@ -137,7 +137,7 @@ func runGenerative(mode string, args []string, in io.Reader, out, errOut io.Writ
 	if topNDefault == 0 {
 		topNDefault = 8
 	}
-	topN := fs.Int("top-n", topNDefault, "power-of-two candidate count")
+	topN := fs.Int("top-n", topNDefault, "candidate count (power of two only in uniform mode)")
 	coding := fs.String("coding", defaultString(local.Coding, "huffman"), "coding mode: huffman or uniform")
 	temperatureDefault := local.Temperature
 	if temperatureDefault == 0 {
@@ -324,7 +324,9 @@ func runChain(mode string, args []string, in io.Reader, out, errOut io.Writer) e
 	defer model.Close()
 	cfg := decalgo.GenerativeConfig{Prompt: local.Prompt, TopN: local.TopN, Coding: local.Coding,
 		Temperature: local.Temperature, FinishTokens: local.FinishTokens, ChainSystem: local.ChainSystem,
-		StrictStyle: local.StrictStyle, CandidatePool: local.CandidatePool, RefreshSentences: local.RefreshSentences}
+		StrictStyle: local.StrictStyle, CandidatePool: local.CandidatePool, RefreshSentences: local.RefreshSentences,
+		CarrierTrials: local.CarrierTrials, NaturalnessSlack: local.NaturalnessSlack, SemanticJudge: local.SemanticJudge,
+		SemanticThreshold: local.SemanticThreshold, LengthBias: local.LengthBias}
 	chain, err := decalgo.NewConversationChain(model, key, state.Conversation, cfg)
 	if err != nil {
 		return err
@@ -514,6 +516,8 @@ func interactiveSend(ctx context.Context, out, errOut io.Writer, chain *decalgo.
 	}
 	fmt.Fprintf(out, "Encoding budget (local only): plaintext=%d packed=%d authentication=%d framing=%d termination=%d total=%d bytes.\n",
 		budget.PlaintextBytes, budget.PackedBytes, budget.AuthenticationBytes, budget.FrameLengthBytes, budget.TerminationBytes, budget.TotalHiddenBytes)
+	fmt.Fprintf(out, "Authentication search (one boundary): hypotheses=%d effective_bits=%.1f.\n",
+		budget.BaselineAuthenticationHypotheses, budget.BaselineAuthenticationBits)
 	fmt.Fprintln(out, "Generating carrier…")
 	record, err := chain.Send(ctx, sender, []byte(plaintext))
 	if err != nil {
@@ -663,22 +667,27 @@ func showChainState(out io.Writer, state persistedChainState, format string) err
 }
 
 type localGenerativeConfig struct {
-	Runtime          string  `json:"runtime"`
-	Python           string  `json:"python"`
-	Model            string  `json:"model"`
-	Revision         string  `json:"revision"`
-	Prompt           string  `json:"prompt"`
-	TopN             int     `json:"top_n"`
-	Coding           string  `json:"coding"`
-	Temperature      float64 `json:"temperature"`
-	Secure           bool    `json:"secure"`
-	Conversation     string  `json:"conversation"`
-	Direction        string  `json:"direction"`
-	FinishTokens     int     `json:"finish_tokens"`
-	ChainSystem      string  `json:"chain_system"`
-	StrictStyle      bool    `json:"strict_style"`
-	CandidatePool    int     `json:"candidate_pool"`
-	RefreshSentences bool    `json:"refresh_sentences"`
+	Runtime           string  `json:"runtime"`
+	Python            string  `json:"python"`
+	Model             string  `json:"model"`
+	Revision          string  `json:"revision"`
+	Prompt            string  `json:"prompt"`
+	TopN              int     `json:"top_n"`
+	Coding            string  `json:"coding"`
+	Temperature       float64 `json:"temperature"`
+	Secure            bool    `json:"secure"`
+	Conversation      string  `json:"conversation"`
+	Direction         string  `json:"direction"`
+	FinishTokens      int     `json:"finish_tokens"`
+	ChainSystem       string  `json:"chain_system"`
+	StrictStyle       bool    `json:"strict_style"`
+	CandidatePool     int     `json:"candidate_pool"`
+	RefreshSentences  bool    `json:"refresh_sentences"`
+	CarrierTrials     int     `json:"carrier_trials"`
+	NaturalnessSlack  float64 `json:"naturalness_slack"`
+	SemanticJudge     bool    `json:"semantic_judge"`
+	SemanticThreshold float64 `json:"semantic_threshold"`
+	LengthBias        float64 `json:"length_bias"`
 }
 
 func generativeKey() ([]byte, error) {

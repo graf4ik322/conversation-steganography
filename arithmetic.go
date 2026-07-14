@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math"
 	"sort"
+	"unicode/utf8"
 )
 
 const arithmeticTotal uint64 = 32768
@@ -13,7 +14,7 @@ const arithmeticThreeQuarter uint64 = 0xC0000000
 
 type frequencyTable struct{ cumulative []uint64 }
 
-func makeFrequencies(candidates []TokenCandidate, temperature float64) (frequencyTable, error) {
+func makeFrequencies(candidates []TokenCandidate, temperature, lengthBias float64) (frequencyTable, error) {
 	if len(candidates) < 2 || uint64(len(candidates)) >= arithmeticTotal {
 		return frequencyTable{}, errors.New("invalid arithmetic candidate count")
 	}
@@ -26,7 +27,8 @@ func makeFrequencies(candidates []TokenCandidate, temperature float64) (frequenc
 	weights := make([]float64, len(candidates))
 	sum := 0.0
 	for i, c := range candidates {
-		weights[i] = math.Exp((c.LogProb - maxScore) / temperature)
+		visibleCost := utf8.RuneCountInString(c.Text)
+		weights[i] = math.Exp((c.LogProb-maxScore)/temperature - lengthBias*float64(visibleCost))
 		if math.IsNaN(weights[i]) || math.IsInf(weights[i], 0) {
 			return frequencyTable{}, errors.New("invalid model score")
 		}

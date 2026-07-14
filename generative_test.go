@@ -1,8 +1,11 @@
 package decalgo
 
 import (
+	"bytes"
 	"context"
+	"math/rand"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -19,6 +22,16 @@ func (m fakeModel) Tokenize(_ context.Context, text string) ([]int, error) {
 		ids = append(ids, 1000+int(r))
 	}
 	return ids, nil
+}
+
+type lengthModel struct{ fakeModel }
+
+func (m lengthModel) Next(_ context.Context, tokens []int, n int) ([]TokenCandidate, error) {
+	out := make([]TokenCandidate, n)
+	for i := range out {
+		out[i] = TokenCandidate{ID: (len(tokens) + i) % n, LogProb: float64(n - i), Text: strings.Repeat("x", i+1)}
+	}
+	return out, nil
 }
 func (m fakeModel) Detokenize(_ context.Context, ids []int) (string, error) {
 	r := make([]rune, len(ids))
@@ -102,13 +115,131 @@ func TestArithmeticGenerativeRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCarrierMetricsAreCollectedDuringEncoding(t *testing.T) {
+	ctx := context.Background()
+	codec, err := NewGenerativeCodec(lengthModel{fakeModel{"fixture-v1"}}, GenerativeConfig{
+		Prompt: "P", TopN: 8, Coding: "arithmetic", Temperature: 0.7, FinishTokens: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, metrics, err := codec.EncodeWithMetrics(ctx, []byte("metrics"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics.DataTokens == 0 || metrics.VisibleCharacters != len([]rune(text)) {
+		t.Fatalf("incomplete metrics for %q: %#v", text, metrics)
+	}
+	if metrics.MeanLogitRegret < 0 || metrics.WorstLogitRegret < metrics.MeanLogitRegret {
+		t.Fatalf("invalid regret metrics: %#v", metrics)
+	}
+}
+
+func TestLengthBiasedArithmeticRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	codec, err := NewGenerativeCodec(lengthModel{fakeModel{"fixture-v1"}}, GenerativeConfig{
+		Prompt: "P", TopN: 8, Coding: "arithmetic", Temperature: 1, LengthBias: 0.25,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("length-aware arithmetic")
+	text, err := codec.Encode(ctx, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := codec.Decode(ctx, text)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("got %q, %v", got, err)
+	}
+}
+
+func TestArithmeticExactTerminationRandomized(t *testing.T) {
+	ctx := context.Background()
+	rng := rand.New(rand.NewSource(1))
+	for _, topN := range []int{3, 7, 8} {
+		codec, err := NewGenerativeCodec(fakeModel{"fixture-v1"}, GenerativeConfig{
+			Prompt: "P", TopN: topN, Coding: "arithmetic", Temperature: 0.7,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for size := 0; size <= 64; size++ {
+			want := make([]byte, size)
+			if _, err := rng.Read(want); err != nil {
+				t.Fatal(err)
+			}
+			text, err := codec.Encode(ctx, want)
+			if err != nil {
+				t.Fatalf("top-n %d size %d encode: %v", topN, size, err)
+			}
+			got, err := codec.Decode(ctx, text)
+			if err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("top-n %d size %d: got %x, %v; want %x", topN, size, got, err, want)
+			}
+		}
+	}
+}
+
+func TestUnframedArithmeticBoundariesRandomized(t *testing.T) {
+	ctx := context.Background()
+	rng := rand.New(rand.NewSource(3))
+	for _, topN := range []int{3, 7, 8} {
+		codec, err := NewGenerativeCodec(fakeModel{"fixture-v1"}, GenerativeConfig{
+			Prompt: "P", TopN: topN, Coding: "arithmetic", Temperature: 0.7, FinishTokens: 3,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for size := 0; size <= 64; size++ {
+			want := make([]byte, size)
+			if _, err := rng.Read(want); err != nil {
+				t.Fatal(err)
+			}
+			text, _, err := codec.EncodeUnframedWithMetrics(ctx, want)
+			if err != nil {
+				t.Fatalf("top-n %d size %d encode: %v", topN, size, err)
+			}
+			candidates, err := codec.DecodeUnframedCandidates(ctx, text)
+			if err != nil {
+				t.Fatalf("top-n %d size %d decode: %v", topN, size, err)
+			}
+			found := false
+			for _, candidate := range candidates {
+				if bytes.Equal(candidate, want) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("top-n %d size %d missing from %d boundary candidates", topN, size, len(candidates))
+			}
+		}
+	}
+}
+
 func TestGenerativeRejectsInvalidConfiguration(t *testing.T) {
 	model := fakeModel{"fixture-v1"}
-	if _, err := NewGenerativeCodec(model, GenerativeConfig{Prompt: "P", TopN: 7}); err == nil {
+	if _, err := NewGenerativeCodec(model, GenerativeConfig{Prompt: "P", TopN: 7, Coding: "uniform"}); err == nil {
 		t.Fatal("non-power-of-two top-n accepted")
+	}
+	if _, err := NewGenerativeCodec(model, GenerativeConfig{Prompt: "P", TopN: 7, Coding: "arithmetic"}); err != nil {
+		t.Fatalf("arithmetic coding unnecessarily rejected top-n 7: %v", err)
 	}
 	if _, err := NewGenerativeCodec(model, GenerativeConfig{Prompt: "P", TopN: 8, ModelFingerprint: "other"}); err == nil {
 		t.Fatal("wrong model fingerprint accepted")
+	}
+	if _, err := NewGenerativeCodec(model, GenerativeConfig{Prompt: "P", TopN: 8, CarrierTrials: 33}); err == nil {
+		t.Fatal("excessive carrier trial count accepted")
+	}
+	if _, err := NewGenerativeCodec(model, GenerativeConfig{Prompt: "P", TopN: 8, NaturalnessSlack: -0.1}); err == nil {
+		t.Fatal("negative naturalness slack accepted")
+	}
+	if _, err := NewGenerativeCodec(model, GenerativeConfig{Prompt: "P", TopN: 8, SemanticThreshold: -11}); err == nil {
+		t.Fatal("invalid semantic threshold accepted")
+	}
+	if _, err := NewGenerativeCodec(model, GenerativeConfig{Prompt: "P", TopN: 8, LengthBias: 1.1}); err == nil {
+		t.Fatal("invalid length bias accepted")
 	}
 }
 
@@ -128,7 +259,7 @@ func TestOrdinaryVisibleTokenFilter(t *testing.T) {
 			t.Errorf("ordinary token rejected: %q", token)
 		}
 	}
-	rejected := []string{" 09:42", "\n", " message", "(sent", "#", " assistant", "example", "\"hello\"", " ~", "&", " - ", "..."}
+	rejected := []string{" 09:42", "\n", " message", " participants", "(sent", "#", " assistant", "example", "\"hello\"", " ~", "&", " - ", "..."}
 	for _, token := range rejected {
 		if ordinaryVisibleToken(token) {
 			t.Errorf("metadata token accepted: %q", token)

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // TokenCandidate is one possible next token and its model score. LogProb may
@@ -35,16 +36,21 @@ type copySafeLanguageModel interface {
 
 // GenerativeConfig is shared protocol state, not a secret.
 type GenerativeConfig struct {
-	Prompt           string
-	ChainSystem      string
-	TopN             int
-	Coding           string
-	Temperature      float64
-	FinishTokens     int
-	StrictStyle      bool
-	CandidatePool    int
-	RefreshSentences bool
-	ModelFingerprint string
+	Prompt            string
+	ChainSystem       string
+	TopN              int
+	Coding            string
+	Temperature       float64
+	FinishTokens      int
+	StrictStyle       bool
+	CandidatePool     int
+	RefreshSentences  bool
+	CarrierTrials     int
+	NaturalnessSlack  float64
+	SemanticJudge     bool
+	SemanticThreshold float64
+	LengthBias        float64
+	ModelFingerprint  string
 }
 
 // GenerativeCodec embeds framed bytes in deterministic next-token choices.
@@ -55,8 +61,6 @@ type GenerativeCodec struct {
 	bits  int
 }
 
-const arithmeticGuardBits = 32
-
 func NewGenerativeCodec(model LanguageModel, cfg GenerativeConfig) (*GenerativeCodec, error) {
 	if model == nil {
 		return nil, errors.New("language model is required")
@@ -64,14 +68,20 @@ func NewGenerativeCodec(model LanguageModel, cfg GenerativeConfig) (*GenerativeC
 	if cfg.Prompt == "" {
 		return nil, errors.New("prompt must not be empty")
 	}
-	if cfg.TopN < 2 || cfg.TopN&(cfg.TopN-1) != 0 {
-		return nil, errors.New("top-n must be a power of two greater than one")
+	if cfg.TopN < 2 {
+		return nil, errors.New("top-n must be greater than one")
 	}
 	if cfg.Coding == "" {
 		cfg.Coding = "uniform"
 	}
 	if cfg.Coding != "uniform" && cfg.Coding != "huffman" && cfg.Coding != "arithmetic" {
 		return nil, errors.New("coding must be uniform, huffman, or arithmetic")
+	}
+	if cfg.Coding == "uniform" && cfg.TopN&(cfg.TopN-1) != 0 {
+		return nil, errors.New("top-n must be a power of two for uniform coding")
+	}
+	if cfg.Coding == "arithmetic" && uint64(cfg.TopN) >= arithmeticTotal {
+		return nil, fmt.Errorf("top-n must be below %d for arithmetic coding", arithmeticTotal)
 	}
 	if cfg.Temperature == 0 {
 		cfg.Temperature = 1
@@ -88,6 +98,24 @@ func NewGenerativeCodec(model LanguageModel, cfg GenerativeConfig) (*GenerativeC
 	if cfg.CandidatePool < 1 || cfg.CandidatePool > 16 {
 		return nil, errors.New("candidate-pool must be between 1 and 16")
 	}
+	if cfg.CarrierTrials == 0 {
+		cfg.CarrierTrials = 1
+	}
+	if cfg.CarrierTrials < 1 || cfg.CarrierTrials > 32 {
+		return nil, errors.New("carrier-trials must be between 1 and 32")
+	}
+	if cfg.NaturalnessSlack == 0 {
+		cfg.NaturalnessSlack = 0.35
+	}
+	if cfg.NaturalnessSlack < 0 || cfg.NaturalnessSlack > 2 {
+		return nil, errors.New("naturalness-slack must be between 0 and 2")
+	}
+	if cfg.SemanticThreshold < -10 || cfg.SemanticThreshold > 10 {
+		return nil, errors.New("semantic-threshold must be between -10 and 10")
+	}
+	if cfg.LengthBias < 0 || cfg.LengthBias > 1 {
+		return nil, errors.New("length-bias must be between 0 and 1")
+	}
 	if cfg.ModelFingerprint == "" {
 		cfg.ModelFingerprint = model.Fingerprint()
 	}
@@ -99,27 +127,82 @@ func NewGenerativeCodec(model LanguageModel, cfg GenerativeConfig) (*GenerativeC
 
 func (c *GenerativeCodec) Config() GenerativeConfig { return c.cfg }
 
+type CarrierMetrics struct {
+	DataTokens        int
+	FinishTokens      int
+	VisibleCharacters int
+	MeanLogitRegret   float64
+	WorstLogitRegret  float64
+	totalLogitRegret  float64
+}
+
+func (m *CarrierMetrics) observe(candidates []TokenCandidate, selected int) {
+	if m == nil {
+		return
+	}
+	regret := candidates[0].LogProb - candidates[selected].LogProb
+	if regret < 0 {
+		regret = 0
+	}
+	m.DataTokens++
+	m.totalLogitRegret += regret
+	if regret > m.WorstLogitRegret {
+		m.WorstLogitRegret = regret
+	}
+}
+
 // Encode frames payload with a variable-length byte count and returns generated text.
 func (c *GenerativeCodec) Encode(ctx context.Context, payload []byte) (string, error) {
+	return c.encode(ctx, payload, nil, true)
+}
+
+func (c *GenerativeCodec) EncodeWithMetrics(ctx context.Context, payload []byte) (string, CarrierMetrics, error) {
+	metrics := CarrierMetrics{}
+	text, err := c.encode(ctx, payload, &metrics, true)
+	if metrics.DataTokens > 0 {
+		metrics.MeanLogitRegret = metrics.totalLogitRegret / float64(metrics.DataTokens)
+	}
+	metrics.VisibleCharacters = utf8.RuneCountInString(text)
+	return text, metrics, err
+}
+
+func (c *GenerativeCodec) EncodeUnframedWithMetrics(ctx context.Context, payload []byte) (string, CarrierMetrics, error) {
+	metrics := CarrierMetrics{}
+	text, err := c.encode(ctx, payload, &metrics, false)
+	if metrics.DataTokens > 0 {
+		metrics.MeanLogitRegret = metrics.totalLogitRegret / float64(metrics.DataTokens)
+	}
+	metrics.VisibleCharacters = utf8.RuneCountInString(text)
+	return text, metrics, err
+}
+
+func (c *GenerativeCodec) encode(ctx context.Context, payload []byte, metrics *CarrierMetrics, framed bool) (string, error) {
 	if uint64(len(payload)) > uint64(^uint32(0)) {
 		return "", errors.New("payload is too large")
 	}
-	frame := binary.AppendUvarint(nil, uint64(len(payload)))
-	frame = append(frame, payload...)
+	data := payload
+	if framed {
+		data = binary.AppendUvarint(nil, uint64(len(payload)))
+		data = append(data, payload...)
+	}
 	contextTokens, err := c.model.Tokenize(ctx, c.cfg.Prompt)
 	if err != nil {
 		return "", fmt.Errorf("tokenize prompt: %w", err)
 	}
-	generated := make([]int, 0, (len(frame)*8+c.bits-1)/c.bits)
+	estimatedTokens := len(data) * 8
+	if c.cfg.Coding == "uniform" {
+		estimatedTokens = (len(data)*8 + c.bits - 1) / c.bits
+	}
+	generated := make([]int, 0, estimatedTokens)
 	sinceRefresh := 0
 	bitOffset := 0
 	if c.cfg.Coding == "arithmetic" {
 		readOffset := 0
 		sourceBit := func(offset int) int {
-			if offset < len(frame)*8 {
-				return readBits(frame, offset, 1)
+			if offset < len(data)*8 {
+				return readBits(data, offset, 1)
 			}
-			if (offset-len(frame)*8)%2 == 0 {
+			if (offset-len(data)*8)%2 == 0 {
 				return 1
 			}
 			return 0
@@ -134,13 +217,17 @@ func (c *GenerativeCodec) Encode(ctx context.Context, payload []byte) (string, e
 			}
 			confirmed++
 		})
-		targetBits := len(frame)*8 + arithmeticGuardBits
+		// The frame length makes the stream self-delimiting. Stop as soon as
+		// every frame bit has been forced by the chosen token intervals; an
+		// additional sentinel would carry no information and lengthen every
+		// carrier.
+		targetBits := len(data) * 8
 		for confirmed < targetBits {
 			candidates, err := c.candidates(ctx, contextTokens, generated)
 			if err != nil {
 				return "", err
 			}
-			frequencies, err := makeFrequencies(candidates, c.cfg.Temperature)
+			frequencies, err := makeFrequencies(candidates, c.cfg.Temperature, c.cfg.LengthBias)
 			if err != nil {
 				return "", err
 			}
@@ -149,6 +236,7 @@ func (c *GenerativeCodec) Encode(ctx context.Context, payload []byte) (string, e
 			if desynchronized {
 				return "", errors.New("arithmetic coder desynchronized")
 			}
+			metrics.observe(candidates, symbol)
 			token := candidates[symbol].ID
 			generated = append(generated, token)
 			contextTokens = append(contextTokens, token)
@@ -160,18 +248,18 @@ func (c *GenerativeCodec) Encode(ctx context.Context, payload []byte) (string, e
 				}
 				sinceRefresh = 0
 			}
-			if len(generated) > len(frame)*64+1024 {
+			if len(generated) > len(data)*64+1024 {
 				return "", fmt.Errorf("arithmetic coder failed to make progress after %d tokens (%d/%d bits confirmed)", len(generated), confirmed, targetBits)
 			}
 		}
 		bitOffset = confirmed
 	} else {
-		for bitOffset < len(frame)*8 {
+		for bitOffset < len(data)*8 {
 			candidates, err := c.candidates(ctx, contextTokens, generated)
 			if err != nil {
 				return "", err
 			}
-			var token int
+			var token, selected int
 			if c.cfg.Coding == "huffman" {
 				tree, err := buildHuffman(candidates, c.cfg.Temperature)
 				if err != nil {
@@ -179,7 +267,7 @@ func (c *GenerativeCodec) Encode(ctx context.Context, payload []byte) (string, e
 				}
 				leaf := tree
 				for leaf.candidate < 0 {
-					bit := readBits(frame, bitOffset, 1)
+					bit := readBits(data, bitOffset, 1)
 					bitOffset++
 					if bit == 0 {
 						leaf = leaf.left
@@ -187,12 +275,15 @@ func (c *GenerativeCodec) Encode(ctx context.Context, payload []byte) (string, e
 						leaf = leaf.right
 					}
 				}
-				token = candidates[leaf.candidate].ID
+				selected = leaf.candidate
+				token = candidates[selected].ID
 			} else {
-				bucket := readBits(frame, bitOffset, c.bits)
+				bucket := readBits(data, bitOffset, c.bits)
 				bitOffset += c.bits
+				selected = bucket
 				token = candidates[bucket].ID
 			}
+			metrics.observe(candidates, selected)
 			generated = append(generated, token)
 			contextTokens = append(contextTokens, token)
 		}
@@ -208,6 +299,9 @@ func (c *GenerativeCodec) Encode(ctx context.Context, payload []byte) (string, e
 			return "", err
 		}
 		token := candidates[0].ID
+		if metrics != nil {
+			metrics.FinishTokens++
+		}
 		generated = append(generated, token)
 		contextTokens = append(contextTokens, token)
 		partial, err := c.model.Detokenize(ctx, generated)
@@ -360,6 +454,110 @@ func (c *GenerativeCodec) Decode(ctx context.Context, text string) ([]byte, erro
 	return append([]byte(nil), decoded[headerBytes:headerBytes+want]...), nil
 }
 
+// DecodeUnframedCandidates recovers the small set of whole-byte payloads that
+// could have ended at the observed arithmetic token boundaries. The caller
+// must use authentication to select one; no unauthenticated candidate is safe
+// to accept as plaintext.
+func (c *GenerativeCodec) DecodeUnframedCandidates(ctx context.Context, text string) ([][]byte, error) {
+	if c.cfg.Coding != "arithmetic" {
+		return nil, errors.New("unframed decoding requires arithmetic coding")
+	}
+	if c.cfg.RefreshSentences {
+		return nil, errors.New("unframed decoding does not support sentence context refresh")
+	}
+	observed, err := c.model.Tokenize(ctx, text)
+	if err != nil {
+		return nil, fmt.Errorf("tokenize generated text: %w", err)
+	}
+	contextTokens, err := c.model.Tokenize(ctx, c.cfg.Prompt)
+	if err != nil {
+		return nil, fmt.Errorf("tokenize prompt: %w", err)
+	}
+	decoded := make([]byte, 0, len(observed))
+	bitOffset := 0
+	encoder := newArithmeticEncoder(func(bit int) { decoded = appendBit(decoded, bitOffset, bit); bitOffset++ })
+	offsets := make([]int, len(observed)+1)
+	greedy := make([]bool, len(observed))
+	visible := make([]int, 0, len(observed))
+	for position, token := range observed {
+		candidates, err := c.candidates(ctx, contextTokens, visible)
+		if err != nil {
+			return nil, err
+		}
+		symbol := -1
+		for i, candidate := range candidates {
+			if candidate.ID == token {
+				symbol = i
+				break
+			}
+		}
+		if symbol < 0 {
+			return nil, fmt.Errorf("token %d is outside the arithmetic candidate set", token)
+		}
+		frequencies, err := makeFrequencies(candidates, c.cfg.Temperature, c.cfg.LengthBias)
+		if err != nil {
+			return nil, err
+		}
+		encoder.symbol(symbol, frequencies)
+		greedy[position] = symbol == 0
+		contextTokens = append(contextTokens, token)
+		visible = append(visible, token)
+		offsets[position+1] = bitOffset
+	}
+
+	suffixGreedy := make([]bool, len(observed)+1)
+	suffixGreedy[len(observed)] = true
+	for i := len(observed) - 1; i >= 0; i-- {
+		suffixGreedy[i] = greedy[i] && suffixGreedy[i+1]
+	}
+	firstEnd := len(observed) - c.cfg.FinishTokens
+	if firstEnd < 0 {
+		firstEnd = 0
+	}
+	seen := make(map[string]struct{})
+	var payloads [][]byte
+	for dataEnd := firstEnd; dataEnd <= len(observed); dataEnd++ {
+		if !suffixGreedy[dataEnd] {
+			continue
+		}
+		if dataEnd == 0 {
+			payloads = append(payloads, []byte{})
+			seen[""] = struct{}{}
+			continue
+		}
+		previousBits := offsets[dataEnd-1]
+		confirmedBits := offsets[dataEnd]
+		for byteLength := previousBits/8 + 1; byteLength*8 <= confirmedBits; byteLength++ {
+			targetBits := byteLength * 8
+			valid := true
+			for bit := targetBits; bit < confirmedBits; bit++ {
+				want := 1
+				if (bit-targetBits)%2 == 1 {
+					want = 0
+				}
+				if readBits(decoded, bit, 1) != want {
+					valid = false
+					break
+				}
+			}
+			if !valid || byteLength > len(decoded) {
+				continue
+			}
+			payload := append([]byte(nil), decoded[:byteLength]...)
+			key := string(payload)
+			if _, duplicate := seen[key]; duplicate {
+				continue
+			}
+			seen[key] = struct{}{}
+			payloads = append(payloads, payload)
+		}
+	}
+	if len(payloads) == 0 {
+		return nil, errors.New("generated text contains no complete unframed arithmetic payload")
+	}
+	return payloads, nil
+}
+
 func (c *GenerativeCodec) decodeArithmetic(ctx context.Context, observed, contextTokens []int) ([]byte, error) {
 	decoded := make([]byte, 0, len(observed))
 	bitOffset := 0
@@ -382,7 +580,7 @@ func (c *GenerativeCodec) decodeArithmetic(ctx context.Context, observed, contex
 		if symbol < 0 {
 			return nil, fmt.Errorf("token %d is outside the arithmetic candidate set", token)
 		}
-		frequencies, err := makeFrequencies(candidates, c.cfg.Temperature)
+		frequencies, err := makeFrequencies(candidates, c.cfg.Temperature, c.cfg.LengthBias)
 		if err != nil {
 			return nil, err
 		}
@@ -397,23 +595,9 @@ func (c *GenerativeCodec) decodeArithmetic(ctx context.Context, observed, contex
 			}
 			if ready {
 				wantBits := (headerBytes + want) * 8
-				targetBits := wantBits + arithmeticGuardBits
-				if bitOffset >= targetBits {
-					guardOK := true
-					for i := wantBits; i < targetBits; i++ {
-						want := 0
-						if (i-wantBits)%2 == 0 {
-							want = 1
-						}
-						if readBits(decoded, i, 1) != want {
-							guardOK = false
-							break
-						}
-					}
-					if guardOK {
-						dataEnd = position + 1
-						break
-					}
+				if bitOffset >= wantBits {
+					dataEnd = position + 1
+					break
 				}
 			}
 		}
@@ -548,6 +732,7 @@ func (c *GenerativeCodec) candidates(ctx context.Context, tokens, visibleTokens 
 var disallowedVisibleWords = map[string]struct{}{
 	"assistant": {}, "example": {}, "format": {}, "input": {}, "instruction": {}, "instructions": {},
 	"message": {}, "messages": {}, "metadata": {}, "note": {}, "output": {}, "prompt": {}, "prompts": {},
+	"participant": {}, "participants": {},
 	"recipient": {}, "recipients": {}, "response": {}, "role": {}, "sender": {}, "sent": {}, "system": {},
 	"timestamp": {}, "transcript": {}, "user": {}, "analysis": {},
 }

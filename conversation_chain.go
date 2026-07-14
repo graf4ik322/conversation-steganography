@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -35,29 +36,63 @@ type ConversationChain struct {
 // sender, sequence, and chain state are synchronized context and are not part
 // of the encoded payload.
 type EncodingBudget struct {
-	PlaintextBytes      int
-	PackedBytes         int
-	AuthenticationBytes int
-	FrameLengthBytes    int
-	TerminationBytes    int
-	TotalHiddenBytes    int
+	PlaintextBytes                   int
+	PackedBytes                      int
+	AuthenticationBytes              int
+	FrameLengthBytes                 int
+	TerminationBytes                 int
+	TotalHiddenBytes                 int
+	BaselineAuthenticationHypotheses int
+	BaselineAuthenticationBits       float64
+}
+
+const maxAuthenticationHypotheses = 1 << 15
+
+func authenticationHypotheses(candidateCount, trials int) (int, error) {
+	if candidateCount < 1 || trials < 1 {
+		return 0, errors.New("authentication search dimensions must be positive")
+	}
+	// Each boundary candidate tries every detached mode and trial, then the
+	// inline-mode legacy form and the former GCM form.
+	perCandidate := trials*(len(packingModes())+1) + 1
+	if candidateCount > maxAuthenticationHypotheses/perCandidate {
+		return 0, fmt.Errorf("authentication search would exceed %d hypotheses", maxAuthenticationHypotheses)
+	}
+	return candidateCount * perCandidate, nil
+}
+
+func effectiveAuthenticationBits(hypotheses int) float64 {
+	if hypotheses < 1 {
+		return 0
+	}
+	return 128 - math.Log2(float64(hypotheses))
 }
 
 func (c *ConversationChain) EncodingBudget(plaintext []byte) (EncodingBudget, error) {
-	packed, err := packMessage(plaintext)
+	_, packed, err := packMessageDetached(plaintext, c.compressionDictionary())
 	if err != nil {
 		return EncodingBudget{}, err
 	}
-	sealedBytes := sivTagSize + len(packed)
-	frameLengthBytes := binary.PutUvarint(make([]byte, binary.MaxVarintLen64), uint64(sealedBytes))
-	terminationBytes := 0
-	if c.baseConfig.Coding == "arithmetic" {
-		terminationBytes = arithmeticGuardBits / 8
+	authenticationBytes := sivTagSize
+	frameLengthBytes := 0
+	trials := c.baseConfig.CarrierTrials
+	if trials == 0 {
+		trials = 1
+	}
+	hypotheses, err := authenticationHypotheses(1, trials)
+	if err != nil {
+		return EncodingBudget{}, err
+	}
+	authenticationBits := effectiveAuthenticationBits(hypotheses)
+	sealedBytes := authenticationBytes + len(packed)
+	if !c.usesUnframedArithmetic() {
+		frameLengthBytes = binary.PutUvarint(make([]byte, binary.MaxVarintLen64), uint64(sealedBytes))
 	}
 	return EncodingBudget{
-		PlaintextBytes: len(plaintext), PackedBytes: len(packed), AuthenticationBytes: sivTagSize,
-		FrameLengthBytes: frameLengthBytes, TerminationBytes: terminationBytes,
-		TotalHiddenBytes: frameLengthBytes + sealedBytes + terminationBytes,
+		PlaintextBytes: len(plaintext), PackedBytes: len(packed), AuthenticationBytes: authenticationBytes,
+		FrameLengthBytes: frameLengthBytes, TerminationBytes: 0,
+		TotalHiddenBytes:                 frameLengthBytes + sealedBytes,
+		BaselineAuthenticationHypotheses: hypotheses, BaselineAuthenticationBits: authenticationBits,
 	}, nil
 }
 
@@ -113,23 +148,106 @@ func (c *ConversationChain) Send(ctx context.Context, from string, plaintext []b
 	if err != nil {
 		return ChainRecord{}, err
 	}
+	trialCount := codec.Config().CarrierTrials
+	var options []carrierOption
 	var lastErr error
-	for attempt := 0; attempt < 8; attempt++ {
-		sealed, err := c.seal(from, record.Index, record.SenderSequence, plaintext)
+	for trial := 0; trial < trialCount; trial++ {
+		sealed, err := c.sealTrial(from, record.Index, record.SenderSequence, trial, plaintext)
 		if err != nil {
 			return ChainRecord{}, err
 		}
-		record.Encrypted, err = codec.Encode(ctx, sealed)
-		if err == nil {
-			c.commit(record)
-			return record, nil
+		var carrier string
+		var metrics CarrierMetrics
+		if c.usesUnframedArithmetic() {
+			carrier, metrics, err = codec.EncodeUnframedWithMetrics(ctx, sealed)
+		} else {
+			carrier, metrics, err = codec.EncodeWithMetrics(ctx, sealed)
 		}
-		lastErr = err
-		if !strings.Contains(err.Error(), "tokenizer cannot losslessly represent") {
+		if err != nil {
+			lastErr = err
+			if strings.Contains(err.Error(), "tokenizer cannot losslessly represent") {
+				continue
+			}
 			return ChainRecord{}, err
 		}
+		human := humanWrittenCarrier(carrier)
+		semanticMargin := math.Inf(1)
+		if codec.Config().SemanticJudge {
+			semanticMargin = math.Inf(-1)
+		}
+		if human && codec.Config().SemanticJudge {
+			_, semanticMargin, err = semanticHumanWritten(ctx, c.model, carrier)
+			if err != nil {
+				return ChainRecord{}, fmt.Errorf("judge generated carrier: %w", err)
+			}
+			human = semanticMargin >= codec.Config().SemanticThreshold
+		}
+		options = append(options, carrierOption{text: carrier, metrics: metrics, human: human, semanticMargin: semanticMargin})
 	}
-	return ChainRecord{}, fmt.Errorf("could not produce a transport-safe carrier after 8 attempts: %w", lastErr)
+	best := selectCarrier(options, codec.Config().StrictStyle, codec.Config().NaturalnessSlack)
+	if best == "" {
+		if lastErr != nil {
+			return ChainRecord{}, fmt.Errorf("could not produce a transport-safe carrier after %d trials: %w", trialCount, lastErr)
+		}
+		if len(options) != 0 {
+			bestMargin := math.Inf(-1)
+			for _, option := range options {
+				if option.semanticMargin > bestMargin {
+					bestMargin = option.semanticMargin
+				}
+			}
+			return ChainRecord{}, fmt.Errorf("none of %d carrier trials passed the human-writing checks (best semantic YES-NO margin %.3f)", trialCount, bestMargin)
+		}
+		return ChainRecord{}, fmt.Errorf("none of %d carrier trials produced a carrier", trialCount)
+	}
+	record.Encrypted = best
+	c.commit(record)
+	return record, nil
+}
+
+type carrierOption struct {
+	text           string
+	metrics        CarrierMetrics
+	human          bool
+	semanticMargin float64
+}
+
+func (o carrierOption) naturalnessScore() float64 {
+	score := o.metrics.MeanLogitRegret + 0.05*o.metrics.WorstLogitRegret
+	if !math.IsInf(o.semanticMargin, 0) {
+		score -= 0.1 * o.semanticMargin
+	}
+	return score
+}
+
+func selectCarrier(options []carrierOption, strict bool, slack float64) string {
+	if !strict {
+		slack = math.Inf(1)
+	}
+	bestNaturalness := math.Inf(1)
+	for _, option := range options {
+		if strict && !option.human {
+			continue
+		}
+		if score := option.naturalnessScore(); score < bestNaturalness {
+			bestNaturalness = score
+		}
+	}
+	best := ""
+	bestLength := 0
+	for _, option := range options {
+		if strict && !option.human {
+			continue
+		}
+		if option.naturalnessScore() > bestNaturalness+slack {
+			continue
+		}
+		length := option.metrics.VisibleCharacters
+		if best == "" || length < bestLength {
+			best, bestLength = option.text, length
+		}
+	}
+	return best
 }
 
 func (c *ConversationChain) Receive(ctx context.Context, from, encrypted string) ([]byte, ChainRecord, error) {
@@ -144,16 +262,44 @@ func (c *ConversationChain) Receive(ctx context.Context, from, encrypted string)
 	if err != nil {
 		return nil, ChainRecord{}, err
 	}
-	sealed, err := codec.Decode(ctx, encrypted)
-	if err != nil {
-		return nil, ChainRecord{}, err
+	var plaintext []byte
+	accepted := false
+	if c.usesUnframedArithmetic() {
+		var candidates [][]byte
+		candidates, err = codec.DecodeUnframedCandidates(ctx, encrypted)
+		if err == nil {
+			if _, searchErr := authenticationHypotheses(len(candidates), codec.Config().CarrierTrials); searchErr != nil {
+				return nil, ChainRecord{}, searchErr
+			}
+			for _, sealed := range candidates {
+				plaintext, err = c.openTrials(from, record.Index, record.SenderSequence, sealed, codec.Config().CarrierTrials)
+				if err == nil {
+					accepted = true
+					break
+				}
+			}
+		}
 	}
-	plaintext, err := c.open(from, record.Index, record.SenderSequence, sealed)
+	if !accepted {
+		var sealed []byte
+		sealed, err = codec.Decode(ctx, encrypted)
+		if err == nil {
+			plaintext, err = c.openTrials(from, record.Index, record.SenderSequence, sealed, codec.Config().CarrierTrials)
+			accepted = err == nil
+		}
+	}
+	if !accepted && err == nil {
+		err = errors.New("carrier did not contain an authentic payload")
+	}
 	if err != nil {
 		return nil, ChainRecord{}, fmt.Errorf("%w at index %d for sender %q (local sync %s); verify the same phrase and conversation, exact sender name, exact unedited carrier, and identical prior-message order on both devices", err, record.Index, from, c.SyncCode())
 	}
 	c.commit(record)
 	return plaintext, record, nil
+}
+
+func (c *ConversationChain) usesUnframedArithmetic() bool {
+	return c.baseConfig.Coding == "arithmetic" && !c.baseConfig.RefreshSentences
 }
 
 func (c *ConversationChain) messageConfig(from string) GenerativeConfig {
@@ -203,15 +349,46 @@ func (c *ConversationChain) commit(record ChainRecord) {
 }
 
 func (c *ConversationChain) seal(from string, index, sequence uint64, plaintext []byte) ([]byte, error) {
-	packed, err := packMessage(plaintext)
+	return c.sealTrial(from, index, sequence, 0, plaintext)
+}
+
+func (c *ConversationChain) sealTrial(from string, index, sequence uint64, trial int, plaintext []byte) ([]byte, error) {
+	mode, packed, err := packMessageDetached(plaintext, c.compressionDictionary())
 	if err != nil {
 		return nil, fmt.Errorf("pack chained message: %w", err)
 	}
-	return sealSIV(c.key, c.aad(from, index, sequence), packed)
+	return sealSIV(c.key, c.trialModeAAD(from, index, sequence, trial, mode), packed)
 }
 
 func (c *ConversationChain) open(from string, index, sequence uint64, sealed []byte) ([]byte, error) {
-	packed, err := openSIV(c.key, c.aad(from, index, sequence), sealed)
+	return c.openTrials(from, index, sequence, sealed, 1)
+}
+
+func (c *ConversationChain) openTrials(from string, index, sequence uint64, sealed []byte, trials int) ([]byte, error) {
+	var packed []byte
+	var err error
+	for trial := 0; trial < trials; trial++ {
+		for _, mode := range packingModes() {
+			var body []byte
+			body, err = openSIV(c.key, c.trialModeAAD(from, index, sequence, trial, mode), sealed)
+			if err == nil {
+				packed = append([]byte{mode}, body...)
+				break
+			}
+		}
+		if packed != nil {
+			break
+		}
+	}
+	if err != nil {
+		// Decode records made by the inline-packing-mode SIV format.
+		for trial := 0; trial < trials; trial++ {
+			packed, err = openSIV(c.key, c.trialAAD(from, index, sequence, trial), sealed)
+			if err == nil {
+				break
+			}
+		}
+	}
 	if err != nil {
 		// Decode records created by the former nonce-bearing AES-GCM format.
 		aead, legacyErr := newAEAD(c.key)
@@ -223,11 +400,33 @@ func (c *ConversationChain) open(from string, index, sequence uint64, sealed []b
 			return nil, errors.New("chained carrier authentication failed")
 		}
 	}
-	plaintext, err := unpackMessage(packed)
+	plaintext, err := unpackMessageWithDictionary(packed, c.compressionDictionary())
 	if err != nil {
 		return nil, fmt.Errorf("unpack chained message: %w", err)
 	}
 	return plaintext, nil
+}
+
+const maxConversationDictionary = 32 << 10
+
+func (c *ConversationChain) compressionDictionary() []byte {
+	if len(c.records) == 0 {
+		return nil
+	}
+	capacity := len(chatDictionary)
+	for _, record := range c.records {
+		capacity += len(record.Encrypted) + 1
+	}
+	dictionary := make([]byte, 0, capacity)
+	dictionary = append(dictionary, chatDictionary...)
+	for _, record := range c.records {
+		dictionary = append(dictionary, '\n')
+		dictionary = append(dictionary, record.Encrypted...)
+	}
+	if len(dictionary) > maxConversationDictionary {
+		dictionary = dictionary[len(dictionary)-maxConversationDictionary:]
+	}
+	return dictionary
 }
 
 func (c *ConversationChain) aad(from string, index, sequence uint64) []byte {
@@ -240,6 +439,19 @@ func (c *ConversationChain) aad(from string, index, sequence uint64) []byte {
 	b = append(b, chainNumbers(index, sequence)...)
 	b = append(b, c.chain[:]...)
 	return b
+}
+
+func (c *ConversationChain) trialAAD(from string, index, sequence uint64, trial int) []byte {
+	aad := c.aad(from, index, sequence)
+	if trial == 0 {
+		return aad
+	}
+	return append(aad, 0, 't', 'r', 'i', 'a', 'l', byte(trial))
+}
+
+func (c *ConversationChain) trialModeAAD(from string, index, sequence uint64, trial int, mode byte) []byte {
+	aad := c.trialAAD(from, index, sequence, trial)
+	return append(aad, 0, 'p', 'a', 'c', 'k', mode)
 }
 
 func chainNumbers(index, sequence uint64) []byte {
@@ -260,4 +472,74 @@ func validateSender(from string) error {
 		return errors.New("sender name is too long")
 	}
 	return nil
+}
+
+// humanWrittenCarrier is deliberately conservative and deterministic. It
+// rejects conspicuous generation failures while leaving grammar decisions to
+// the language model. Selection among passing trials is then purely by visible
+// character count.
+func humanWrittenCarrier(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" || !endsSentence(trimmed) || strings.Count(trimmed, "?") > 4 {
+		return false
+	}
+	if strings.ContainsAny(trimmed, "\r\n\t") || strings.Contains(trimmed, "  ") {
+		return false
+	}
+	words := strings.Fields(strings.ToLower(trimmed))
+	if len(words) < 3 {
+		return false
+	}
+	normalized := make([]string, len(words))
+	for i, word := range words {
+		normalized[i] = strings.Trim(word, ".,!?;:'\"")
+		if i > 0 && normalized[i] != "" && normalized[i] == normalized[i-1] {
+			return false
+		}
+	}
+	seen := make(map[string]struct{}, len(words))
+	for i := 0; i+3 < len(normalized); i++ {
+		gram := strings.Join(normalized[i:i+4], " ")
+		if _, duplicate := seen[gram]; duplicate {
+			return false
+		}
+		seen[gram] = struct{}{}
+	}
+	return true
+}
+
+func semanticHumanWritten(ctx context.Context, model LanguageModel, text string) (bool, float64, error) {
+	prompt := "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n" +
+		"You are a strict prose reviewer. Decide whether the supplied text could plausibly be one ordinary message written by a real person to a close friend. It must be coherent as a whole, grammatically understandable, stay on one topic, avoid abrupt non sequiturs and excessive questions, and contain no labels, metadata, prompt language, or conspicuous repetition. Minor casual phrasing is fine. Answer only YES or NO." +
+		"<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nMESSAGE:\nI finally tried that bakery near work, and the cinnamon rolls were incredible. I might go back tomorrow.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nYES" +
+		"<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nMESSAGE:\nThe movie was funny. Anyway my neighbor owns six lamps. Did you eat? The ending because yesterday.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nNO" +
+		"<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nMESSAGE:\n" + escapePromptControl(text) +
+		"<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+	tokens, err := model.Tokenize(ctx, prompt)
+	if err != nil {
+		return false, 0, fmt.Errorf("tokenize review prompt: %w", err)
+	}
+	candidates, err := model.Next(ctx, tokens, 256)
+	if err != nil {
+		return false, 0, fmt.Errorf("score review response: %w", err)
+	}
+	yesScore, noScore := math.Inf(-1), math.Inf(-1)
+	for _, candidate := range candidates {
+		answer := strings.Trim(strings.ToLower(strings.TrimSpace(candidate.Text)), ".,!;:'\"")
+		switch answer {
+		case "yes":
+			if candidate.LogProb > yesScore {
+				yesScore = candidate.LogProb
+			}
+		case "no":
+			if candidate.LogProb > noScore {
+				noScore = candidate.LogProb
+			}
+		}
+	}
+	if math.IsInf(yesScore, -1) || math.IsInf(noScore, -1) {
+		return false, 0, errors.New("review model did not expose both YES and NO tokens")
+	}
+	margin := yesScore - noScore
+	return margin >= 0, margin, nil
 }

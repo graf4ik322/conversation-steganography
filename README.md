@@ -273,12 +273,87 @@ impersonation is in scope.
 There is an unavoidable capacity tradeoff, but the chain carrier contains no
 sender label, timestamp, index, conversation name, or random nonce. Ordinary
 chat text is first compressed with a shared static dictionary. AES-SIV then
-adds only its required 16-byte authentication tag. The model frame adds a
-variable-length payload count (normally one byte) and arithmetic coding adds a
-four-byte termination guard. Sender identity, ordering, and prior chain hash
-are synchronized associated data rather than encoded payload bytes. Before
+adds only its required 16-byte authentication tag. Chained arithmetic carriers
+have no length frame or termination sentinel. The receiver replays the model
+once, finds whole-byte boundaries crossed by each arithmetic token, verifies
+the deterministic alternating tail bits, and lets the authentication tag select
+the unique payload. The standalone generative API retains its self-describing
+length frame. Sender
+identity, ordering, and prior chain hash are synchronized associated data rather than encoded payload bytes. Before
 each interactive send, the local UI prints this complete byte budget; that
 diagnostic line is never part of the messaging-platform carrier.
+
+For short messages, a one-byte static fragment code represents common chat
+phrases and their leading spaces directly. A denser six-bit variant is also
+considered for very short messages, with its final padding count folded into
+the packing-mode byte. A competing five-bit table covers the sixteen most
+frequent connective fragments; it wins only when their skew outweighs extra
+literal escapes. On a connective-heavy test sentence it uses eight bytes for
+36 input bytes. Longer or unusual input falls back
+to dictionary DEFLATE or raw bytes, whichever is smallest. For example,
+Exact matches for a small stable phrasebook—including `meet me after lunch`,
+acknowledgements, status updates, and common questions—occupy one mode byte in
+the standalone packed format. In a chained carrier, that phrase identity is
+detached into domain-separated AES-SIV associated data; the
+receiver tries the finite phrase set and accepts only the authenticated choice.
+Consequently an exact phrase has a zero-byte encrypted body and only the
+16-byte AES-SIV tag remains: there is no framing, mode, phrase index, nonce, or
+ciphertext byte. With eight trials and one arithmetic boundary, the current
+553 hypotheses retain about 118.9 effective bits. The decoder caps adversarial unframed search
+at 32,768 hypotheses; including legacy fallback keeps the union-bound floor
+above 112 bits. It refuses larger searches before authentication work begins.
+Non-phrase messages continue through the fragment and compression
+competition. This mode and boundary search remains fully binary-safe and
+does not weaken authentication.
+
+After the first chained message, the most recent 32 KiB of already committed
+carrier prose also becomes a synchronized DEFLATE dictionary. This costs no
+wire bytes: every participant derives the same dictionary from the authenticated
+public transcript. It helps repeated names, places, and topics that a static
+chat dictionary cannot anticipate. Restoring the same ordered records restores
+the exact compression context; a missing or reordered record already fails the
+conversation chain.
+
+The chain sender can also search several deterministic AES-SIV variants and
+choose the shortest carrier that passes conservative prose checks. The trial
+number is domain-separated associated data: it adds no payload byte and the
+receiver discovers it by authentication. `carrier_trials` in
+`decalgo.local.json` controls the shared search range (currently eight, maximum
+32). Higher values trade generation time for a better chance of a short,
+natural carrier; both peers must use the same value.
+
+Strict selection also records token-level logit regret during arithmetic
+generation, requiring no additional model pass. It first finds the most
+model-likely human-shaped trial, then chooses the shortest trial within
+`naturalness_slack` of that score (currently `0.35`). Mean regret captures the
+whole continuation and a smaller tail term catches isolated improbable token
+choices. Raising the slack approaches absolute shortest-passing selection;
+lowering it prioritizes model-likeness. This control affects sender selection,
+not payload size or receiver authentication.
+
+The pinned model remains at temperature `1.0`. For the same 16-byte phrase
+payload and eight-trial semantic gate, temperature `1.0` produced a
+248-character approved carrier while `1.2` produced 303 characters. Higher
+token entropy favored less character-efficient spellings, so `1.0` remains the
+measured shorter human-safe operating point.
+
+Arithmetic frequencies also include a synchronized visible-character cost,
+`length_bias`. On the same 16-byte payload, bias `0` produced 248 characters,
+`0.1` produced 245, and `0.2` expanded to 381. The local value is therefore
+`0.1`: it is the measured minimum of the tested points, and semantic review
+still gates every selected carrier. Peers must share this value because it
+changes arithmetic intervals.
+
+When `semantic_judge` is enabled, each surface-valid trial is also reviewed by
+the same pinned local model under a separate strict YES/NO coherence prompt.
+The review prompt includes fixed positive and negative examples. Its
+YES-minus-NO logit margin participates in relative ranking across the same
+trial batch, while `semantic_threshold` (locally `-6.0`) remains a fail-closed
+floor for extreme rejection. The judge rejects
+global non sequiturs and malformed continuations that token likelihood alone
+cannot detect. It is sender-side selection only: it adds model work, but no
+hidden byte and no receiver dependency. If every trial fails, strict mode emits
+nothing rather than falling back to suspect prose.
 
 ### Interactive tester
 
