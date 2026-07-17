@@ -1,4 +1,4 @@
-package decalgo
+package conversationstenography
 
 import (
 	"bufio"
@@ -11,7 +11,7 @@ import (
 )
 
 func TestProcessModelProtocol(t *testing.T) {
-	t.Setenv("DECALGO_MODEL_HELPER", "1")
+	t.Setenv("CONVERSATION_STENOGRAPHY_MODEL_HELPER", "1")
 	ctx := context.Background()
 	model, err := NewProcessModel(ctx, os.Args[0], "-test.run=TestProcessModelProtocol")
 	if err != nil {
@@ -70,7 +70,7 @@ func runModelHelper() {
 }
 
 func TestMain(m *testing.M) {
-	if os.Getenv("DECALGO_MODEL_HELPER") == "1" {
+	if os.Getenv("CONVERSATION_STENOGRAPHY_MODEL_HELPER") == "1" {
 		runModelHelper()
 		os.Exit(0)
 	}

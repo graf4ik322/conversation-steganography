@@ -1,4 +1,4 @@
-package decalgo
+package conversationstenography
 
 import "testing"
 

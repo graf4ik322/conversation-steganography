@@ -1,4 +1,4 @@
-module decalgo
+module conversationstenography
 
 go 1.22
 

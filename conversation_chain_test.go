@@ -1,4 +1,4 @@
-package decalgo
+package conversationstenography
 
 import (
 	"context"
@@ -109,11 +109,11 @@ func TestMultiPartyConversationChain(t *testing.T) {
 	alex := newTestChain(t, "friends")
 	sam := newTestChain(t, "friends")
 
-	first, err := sam.Send(ctx, "samir", []byte("hi alex"))
+	first, err := sam.Send(ctx, "bob", []byte("hi alex"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, accepted, err := alex.Receive(ctx, "samir", first.Encrypted)
+	got, accepted, err := alex.Receive(ctx, "bob", first.Encrypted)
 	if err != nil || string(got) != "hi alex" || accepted.SenderSequence != 0 {
 		t.Fatalf("first: %q %#v %v", got, accepted, err)
 	}
@@ -127,11 +127,11 @@ func TestMultiPartyConversationChain(t *testing.T) {
 		t.Fatalf("reply: %q %v", got, err)
 	}
 
-	third, err := sam.Send(ctx, "samir", []byte("yes, the maths homework"))
+	third, err := sam.Send(ctx, "bob", []byte("yes, the maths homework"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, accepted, err = alex.Receive(ctx, "samir", third.Encrypted)
+	got, accepted, err = alex.Receive(ctx, "bob", third.Encrypted)
 	if err != nil || string(got) != "yes, the maths homework" || accepted.SenderSequence != 1 || accepted.Index != 2 {
 		t.Fatalf("third: %q %#v %v", got, accepted, err)
 	}
@@ -155,11 +155,11 @@ func TestMultiPartyConversationChain(t *testing.T) {
 func TestConversationChainRejectsWrongOrderAndSender(t *testing.T) {
 	ctx := context.Background()
 	sender := newTestChain(t, "friends")
-	first, _ := sender.Send(ctx, "samir", []byte("first"))
-	second, _ := sender.Send(ctx, "samir", []byte("second"))
+	first, _ := sender.Send(ctx, "bob", []byte("first"))
+	second, _ := sender.Send(ctx, "bob", []byte("second"))
 
 	wrongOrder := newTestChain(t, "friends")
-	if _, _, err := wrongOrder.Receive(ctx, "samir", second.Encrypted); err == nil {
+	if _, _, err := wrongOrder.Receive(ctx, "bob", second.Encrypted); err == nil {
 		t.Fatal("out-of-order carrier accepted")
 	}
 	wrongSender := newTestChain(t, "friends")
@@ -167,7 +167,7 @@ func TestConversationChainRejectsWrongOrderAndSender(t *testing.T) {
 		t.Fatal("wrong sender accepted")
 	}
 	wrongConversation := newTestChain(t, "other")
-	if _, _, err := wrongConversation.Receive(ctx, "samir", first.Encrypted); err == nil {
+	if _, _, err := wrongConversation.Receive(ctx, "bob", first.Encrypted); err == nil {
 		t.Fatal("wrong conversation accepted")
 	}
 }
@@ -175,12 +175,12 @@ func TestConversationChainRejectsWrongOrderAndSender(t *testing.T) {
 func TestConversationChainRestorePublicState(t *testing.T) {
 	ctx := context.Background()
 	original := newTestChain(t, "friends")
-	first, _ := original.Send(ctx, "samir", []byte("first"))
+	first, _ := original.Send(ctx, "bob", []byte("first"))
 	restored := newTestChain(t, "friends")
 	if err := restored.RestorePublic([]ChainRecord{first}); err != nil {
 		t.Fatal(err)
 	}
-	second, err := restored.Send(ctx, "samir", []byte("second"))
+	second, err := restored.Send(ctx, "bob", []byte("second"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestConversationChainRestorePublicState(t *testing.T) {
 func TestConversationCompressionDictionaryRestoresExactly(t *testing.T) {
 	original := newTestChain(t, "dictionary-restore")
 	original.records = []ChainRecord{
-		{Index: 0, From: "samir", Encrypted: "We should meet beside the northern greenhouse at Riverside Botanical Garden."},
+		{Index: 0, From: "bob", Encrypted: "We should meet beside the northern greenhouse at Riverside Botanical Garden."},
 		{Index: 1, From: "alex", Encrypted: "The northern greenhouse works for me."},
 	}
 	restored := newTestChain(t, "dictionary-restore")
@@ -210,21 +210,21 @@ func TestConversationCompressionDictionaryRestoresExactly(t *testing.T) {
 func TestImplicitCarrierTrialAddsNoPayloadBytes(t *testing.T) {
 	chain := newTestChain(t, "trials")
 	plaintext := []byte("same message")
-	first, err := chain.sealTrial("samir", 0, 0, 0, plaintext)
+	first, err := chain.sealTrial("bob", 0, 0, 0, plaintext)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fourth, err := chain.sealTrial("samir", 0, 0, 3, plaintext)
+	fourth, err := chain.sealTrial("bob", 0, 0, 3, plaintext)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(first) != len(fourth) || reflect.DeepEqual(first, fourth) {
 		t.Fatalf("trial must change ciphertext without changing size: %d/%d equal=%v", len(first), len(fourth), reflect.DeepEqual(first, fourth))
 	}
-	if _, err := chain.openTrials("samir", 0, 0, fourth, 3); err == nil {
+	if _, err := chain.openTrials("bob", 0, 0, fourth, 3); err == nil {
 		t.Fatal("opened a trial outside the synchronized search range")
 	}
-	got, err := chain.openTrials("samir", 0, 0, fourth, 4)
+	got, err := chain.openTrials("bob", 0, 0, fourth, 4)
 	if err != nil || !reflect.DeepEqual(got, plaintext) {
 		t.Fatalf("got %q, %v", got, err)
 	}
@@ -262,7 +262,7 @@ func TestPackingModeIsAuthenticatedWithoutPayloadByte(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sealed, err := chain.sealTrial("samir", 0, 0, 0, plaintext)
+	sealed, err := chain.sealTrial("bob", 0, 0, 0, plaintext)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,10 +270,10 @@ func TestPackingModeIsAuthenticatedWithoutPayloadByte(t *testing.T) {
 		t.Fatalf("mode consumed payload space: mode=%d body=%d sealed=%d", mode, len(body), len(sealed))
 	}
 	wrongMode := mode + 1
-	if _, err := openSIV(chain.key, chain.trialModeAAD("samir", 0, 0, 0, wrongMode), sealed); err == nil {
+	if _, err := openSIV(chain.key, chain.trialModeAAD("bob", 0, 0, 0, wrongMode), sealed); err == nil {
 		t.Fatal("detached packing mode was not authenticated")
 	}
-	got, err := chain.openTrials("samir", 0, 0, sealed, 1)
+	got, err := chain.openTrials("bob", 0, 0, sealed, 1)
 	if err != nil || !reflect.DeepEqual(got, plaintext) {
 		t.Fatalf("got %q, %v", got, err)
 	}
@@ -286,11 +286,11 @@ func TestInlinePackingModeSIVCompatibility(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sealed, err := sealSIV(chain.key, chain.trialAAD("samir", 0, 0, 0), packed)
+	sealed, err := sealSIV(chain.key, chain.trialAAD("bob", 0, 0, 0), packed)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := chain.openTrials("samir", 0, 0, sealed, 1)
+	got, err := chain.openTrials("bob", 0, 0, sealed, 1)
 	if err != nil || !reflect.DeepEqual(got, plaintext) {
 		t.Fatalf("got %q, %v", got, err)
 	}
@@ -301,11 +301,11 @@ func TestFramedGenerativeCarrierCompatibility(t *testing.T) {
 	sender := newTestChain(t, "framed-carrier-compatibility")
 	receiver := newTestChain(t, "framed-carrier-compatibility")
 	plaintext := []byte("legacy framed carrier")
-	sealed, err := sender.sealTrial("samir", 0, 0, 0, plaintext)
+	sealed, err := sender.sealTrial("bob", 0, 0, 0, plaintext)
 	if err != nil {
 		t.Fatal(err)
 	}
-	codec, err := NewGenerativeCodec(sender.model, sender.messageConfig("samir"))
+	codec, err := NewGenerativeCodec(sender.model, sender.messageConfig("bob"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +313,7 @@ func TestFramedGenerativeCarrierCompatibility(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, _, err := receiver.Receive(ctx, "samir", carrier)
+	got, _, err := receiver.Receive(ctx, "bob", carrier)
 	if err != nil || !reflect.DeepEqual(got, plaintext) {
 		t.Fatalf("got %q, %v", got, err)
 	}
@@ -324,13 +324,13 @@ func TestSendSelectsShortestCarrierTrial(t *testing.T) {
 	chain := newTestChain(t, "shortest-trial")
 	chain.baseConfig.CarrierTrials = 4
 	plaintext := []byte("choose the shortest")
-	codec, err := NewGenerativeCodec(chain.model, chain.messageConfig("samir"))
+	codec, err := NewGenerativeCodec(chain.model, chain.messageConfig("bob"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	shortest := 0
 	for trial := 0; trial < 4; trial++ {
-		sealed, err := chain.sealTrial("samir", 0, 0, trial, plaintext)
+		sealed, err := chain.sealTrial("bob", 0, 0, trial, plaintext)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -343,7 +343,7 @@ func TestSendSelectsShortestCarrierTrial(t *testing.T) {
 			shortest = length
 		}
 	}
-	record, err := chain.Send(ctx, "samir", plaintext)
+	record, err := chain.Send(ctx, "bob", plaintext)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +358,7 @@ func TestStrictChainRefusesNonHumanFallback(t *testing.T) {
 	chain.baseConfig.StrictStyle = true
 	chain.baseConfig.CandidatePool = 1
 	chain.baseConfig.CarrierTrials = 2
-	if _, err := chain.Send(context.Background(), "samir", []byte("hello")); err == nil || !strings.Contains(err.Error(), "human-writing checks") {
+	if _, err := chain.Send(context.Background(), "bob", []byte("hello")); err == nil || !strings.Contains(err.Error(), "human-writing checks") {
 		t.Fatalf("strict chain accepted fake non-prose carrier: %v", err)
 	}
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Persistent deterministic MLX-LM backend for decalgo on Apple Silicon."""
+"""Persistent deterministic MLX-LM backend for Conversation Stenography on Apple Silicon."""
 
 import argparse
 import copy

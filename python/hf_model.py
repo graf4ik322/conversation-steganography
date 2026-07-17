@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Persistent deterministic Hugging Face backend for decalgo.
+"""Persistent deterministic Hugging Face backend for Conversation Stenography.
 
 Install: python3 -m pip install torch transformers
-Run indirectly through: decalgo generate ... / decalgo extract ...
+Run indirectly through: Conversation Stenography generate ... / Conversation Stenography extract ...
 """
 
 import argparse

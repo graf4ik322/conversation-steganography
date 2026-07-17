@@ -1,0 +1,229 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"strings"
+
+	conversationstenography "conversationstenography"
+)
+
+// interactiveChain drives the "chain-chat" and "chat" interactive REPLs:
+// reading commands, dispatching sends/receives, and persisting state after
+// every accepted message.
+func interactiveChain(ctx context.Context, in io.Reader, out, errOut io.Writer, chain *conversationstenography.ConversationChain, state *persistedChainState, statePath, initialSender string, platformMode bool, stateKey []byte) error {
+	activeSender := initialSender
+	scanner := bufio.NewScanner(in)
+	scanner.Buffer(make([]byte, 4096), 16*1024*1024)
+	if platformMode {
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "  ┌─────────────────────────────────────┐")
+		fmt.Fprintln(out, "  │        🔒  Secure Chat Active       │")
+		fmt.Fprintln(out, "  └─────────────────────────────────────┘")
+		fmt.Fprintln(out)
+		fmt.Fprintf(out, "  Conversation:  %s\n", state.Conversation)
+		fmt.Fprintf(out, "  You are:       %s\n", activeSender)
+		fmt.Fprintf(out, "  State file:    %s\n", statePath)
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "  HOW TO USE:")
+		fmt.Fprintln(out, "  • Type a message and press Enter → generates cover text to copy")
+		fmt.Fprintln(out, "  • /paste SENDER → paste a message you received from someone")
+		fmt.Fprintln(out, "  • /help → see all commands")
+		fmt.Fprintln(out, "  • /quit → save and exit")
+		fmt.Fprintln(out)
+	} else {
+		fmt.Fprintf(out, "Group chain ready as %s. Type /help for commands.\n", activeSender)
+	}
+	for {
+		fmt.Fprintf(out, "%s> ", activeSender)
+		if !scanner.Scan() {
+			return scanner.Err()
+		}
+		line := scanner.Text()
+		switch {
+		case line == "/quit" || line == "/exit":
+			fmt.Fprintln(out, "\n  Chat saved. Goodbye! 👋")
+			return nil
+		case line == "/help":
+			if platformMode {
+				fmt.Fprintln(out, `
+  ┌─ Commands ────────────────────────────────────────┐
+  │                                                    │
+  │  Messaging:                                        │
+  │    Just type     Send a message (generates cover)  │
+  │    /paste NAME   Paste received message from NAME  │
+  │    /send         Multi-line message (end with /end)│
+  │                                                    │
+  │  Info:                                             │
+  │    /show         Show conversation history         │
+  │    /status       Show sync info                    │
+  │    /record N     Re-print transport record N       │
+  │                                                    │
+  │  Other:                                            │
+  │    /quit         Save and exit                     │
+  │                                                    │
+  └────────────────────────────────────────────────────┘`)
+			} else {
+				fmt.Fprintln(out, `Commands:
+  /as NAME          switch the local sender
+  /paste NAME       paste a raw messaging-app carrier; finish with /end
+  /send             type a multiline plaintext; finish with /end
+  /receive JSON     accept a one-line record from another participant
+  /show             print from|decrypted|encrypted history
+  /status           show identity, state path, and next global index
+  /record INDEX     print one transport record as JSON
+  /quit             save and exit
+Any other line is encrypted and sent as the active participant.`)
+			}
+		case strings.HasPrefix(line, "/as "):
+			name := strings.TrimSpace(strings.TrimPrefix(line, "/as "))
+			if name == "" {
+				fmt.Fprintln(errOut, "sender name cannot be empty")
+				continue
+			}
+			activeSender = name
+			fmt.Fprintf(out, "Now sending as %s.\n", activeSender)
+		case line == "/show":
+			if err := showChainState(out, *state, "table"); err != nil {
+				return err
+			}
+		case line == "/status":
+			fmt.Fprintf(out, "conversation=%q me=%q next_index=%d sync=%s state=%s\n", state.Conversation, activeSender, len(state.Records), chain.SyncCode(), statePath)
+		case strings.HasPrefix(line, "/record "):
+			var index int
+			if _, err := fmt.Sscanf(strings.TrimSpace(strings.TrimPrefix(line, "/record ")), "%d", &index); err != nil || index < 0 || index >= len(state.Records) {
+				fmt.Fprintln(errOut, "invalid record index")
+				continue
+			}
+			fmt.Fprint(out, "record> ")
+			if err := json.NewEncoder(out).Encode(state.Records[index]); err != nil {
+				return err
+			}
+		case strings.HasPrefix(line, "/paste "):
+			sender := strings.TrimSpace(strings.TrimPrefix(line, "/paste "))
+			if sender == "" {
+				fmt.Fprintln(errOut, "  ⚠ Sender name cannot be empty. Usage: /paste TheirName")
+				continue
+			}
+			fmt.Fprintln(out)
+			fmt.Fprintf(out, "  Paste the exact message received from %s below.\n", sender)
+			fmt.Fprintln(out, "  Then type /end on a new line when done:")
+			fmt.Fprintln(out)
+			carrier, ok := readInteractiveBlock(scanner)
+			if !ok {
+				return scanner.Err()
+			}
+			plaintext, accepted, err := chain.Receive(ctx, sender, carrier)
+			if err != nil {
+				fmt.Fprintln(errOut, "  ⚠ Could not decode:", err)
+				continue
+			}
+			state.Records = chain.Records()
+			state.Decrypted[fmt.Sprint(accepted.Index)] = base64.StdEncoding.EncodeToString(plaintext)
+			if err := saveChainState(statePath, *state, stateKey); err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "\n  📩 Message from %s:\n  %s\n\n", sender, plaintext)
+		case line == "/send":
+			fmt.Fprintln(out, "  Type your message, then /end on a new line:")
+			plaintext, ok := readInteractiveBlock(scanner)
+			if !ok {
+				return scanner.Err()
+			}
+			if err := interactiveSend(ctx, out, errOut, chain, state, statePath, activeSender, plaintext, platformMode, stateKey); err != nil {
+				return err
+			}
+		case strings.HasPrefix(line, "/receive "):
+			encoded := strings.TrimSpace(strings.TrimPrefix(line, "/receive "))
+			var incoming conversationstenography.ChainRecord
+			if err := json.Unmarshal([]byte(encoded), &incoming); err != nil {
+				fmt.Fprintln(errOut, "invalid record:", err)
+				continue
+			}
+			if incoming.Index != uint64(len(state.Records)) || incoming.SenderSequence != nextSenderSequence(state.Records, incoming.From) {
+				fmt.Fprintln(errOut, "receive failed: record metadata does not match expected order")
+				continue
+			}
+			plaintext, accepted, err := chain.Receive(ctx, incoming.From, incoming.Encrypted)
+			if err != nil {
+				fmt.Fprintln(errOut, "receive failed:", err)
+				continue
+			}
+			if incoming.Index != accepted.Index || incoming.SenderSequence != accepted.SenderSequence {
+				fmt.Fprintln(errOut, "receive failed: record metadata does not match expected order")
+				continue
+			}
+			state.Records = chain.Records()
+			state.Decrypted[fmt.Sprint(accepted.Index)] = base64.StdEncoding.EncodeToString(plaintext)
+			if err := saveChainState(statePath, *state, stateKey); err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "decrypted[%d] %s> %s\n", accepted.Index, accepted.From, plaintext)
+		case strings.HasPrefix(line, "/"):
+			fmt.Fprintln(errOut, "  Unknown command. Type /help to see available commands.")
+		default:
+			if err := interactiveSend(ctx, out, errOut, chain, state, statePath, activeSender, line, platformMode, stateKey); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func readInteractiveBlock(scanner *bufio.Scanner) (string, bool) {
+	var lines []string
+	for scanner.Scan() {
+		if scanner.Text() == "/end" {
+			return strings.Join(lines, "\n"), true
+		}
+		lines = append(lines, scanner.Text())
+	}
+	return "", false
+}
+
+func interactiveSend(ctx context.Context, out, errOut io.Writer, chain *conversationstenography.ConversationChain, state *persistedChainState, statePath, sender, plaintext string, platformMode bool, stateKey []byte) error {
+	if plaintext == "" {
+		fmt.Fprintln(errOut, "  Message cannot be empty.")
+		return nil
+	}
+	fmt.Fprint(out, "  ⏳ Generating cover text...")
+	record, err := chain.Send(ctx, sender, []byte(plaintext))
+	fmt.Fprint(out, "\r\033[K") // clear the thinking indicator
+	if err != nil {
+		fmt.Fprintln(errOut, "  ⚠ Send failed:", err)
+		return nil
+	}
+	state.Records = chain.Records()
+	state.Decrypted[fmt.Sprint(record.Index)] = base64.StdEncoding.EncodeToString([]byte(plaintext))
+	if err := saveChainState(statePath, *state, stateKey); err != nil {
+		return err
+	}
+	if platformMode {
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "  ┌─── COPY THIS into your messaging app ───┐")
+		fmt.Fprintln(out)
+		fmt.Fprintf(out, "  %s\n", record.Encrypted)
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "  └─── END — send as "+sender+" ───────────────┘")
+		fmt.Fprintln(out)
+	} else {
+		fmt.Fprintf(out, "%s\nsent[%d] %s\nrecord> ", record.Encrypted, record.Index, record.From)
+		if err := json.NewEncoder(out).Encode(record); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func nextSenderSequence(records []conversationstenography.ChainRecord, from string) uint64 {
+	var sequence uint64
+	for _, record := range records {
+		if record.From == from {
+			sequence++
+		}
+	}
+	return sequence
+}
