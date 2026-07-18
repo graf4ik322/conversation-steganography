@@ -40,6 +40,9 @@ COPY --from=frontend-builder /build/dist ./frontend/dist
 COPY python/ ./python/
 RUN pip install --no-cache-dir transformers torch tokenizers 2>/dev/null || true
 
+# Pre-cache the default GPT-2 tokenizer so the server starts without HF download
+RUN python3 -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('openai-community/gpt2')" 2>/dev/null || true
+
 ENV PORT=8080
 ENV STATIC_DIR=/app/frontend/dist
 ENV LOCAL_MODEL=openai-community/gpt2

@@ -79,16 +79,25 @@ func NewOpenRouterModel(config OpenRouterConfig, tokenizer Tokenizer) *OpenRoute
 }
 
 func (m *OpenRouterModel) Fingerprint() string {
+	if m.tokenizer == nil {
+		return "openrouter-null"
+	}
 	h := hmac.New(sha256.New, []byte("openrouter-fingerprint-v1"))
 	h.Write([]byte(m.config.Model))
 	return fmt.Sprintf("openrouter-%x", h.Sum(nil)[:8])
 }
 
 func (m *OpenRouterModel) Tokenize(ctx context.Context, text string) ([]int, error) {
+	if m.tokenizer == nil {
+		return nil, fmt.Errorf("openrouter: tokenizer not available")
+	}
 	return m.tokenizer.Tokenize(ctx, text)
 }
 
 func (m *OpenRouterModel) Detokenize(ctx context.Context, ids []int) (string, error) {
+	if m.tokenizer == nil {
+		return "", fmt.Errorf("openrouter: tokenizer not available")
+	}
 	return m.tokenizer.Detokenize(ctx, ids)
 }
 
@@ -217,15 +226,22 @@ func (m *OpenRouterModel) Next(ctx context.Context, tokens []int, n int) ([]Toke
 	}
 
 	// Batch-convert token strings to IDs using the tokenizer's vocabulary.
-	// This is correct because convert_tokens_to_ids uses the internal vocab
-	// dictionary which is the true reverse mapping (unlike Tokenize/tokenizer.encode).
 	tokenStrings := make([]string, 0, n)
 	for _, tl := range topLogprobs[:n] {
 		tokenStrings = append(tokenStrings, tl.Token)
 	}
-	ids, err := m.tokenizer.TokensToIDs(ctx, tokenStrings)
-	if err != nil {
-		return nil, fmt.Errorf("openrouter: tokens_to_ids: %w", err)
+	var ids []int
+	if m.tokenizer != nil {
+		ids, err = m.tokenizer.TokensToIDs(ctx, tokenStrings)
+		if err != nil {
+			return nil, fmt.Errorf("openrouter: tokens_to_ids: %w", err)
+		}
+	} else {
+		// Without a tokenizer, use candidate index as fake ID
+		ids = make([]int, len(tokenStrings))
+		for i := range ids {
+			ids[i] = i
+		}
 	}
 
 	candidates := make([]TokenCandidate, 0, n)

@@ -54,13 +54,26 @@ func (mf *ModelFactory) createOpenRouterModel(ctx context.Context) (conversation
 		return nil, fmt.Errorf("OPENROUTER_MODEL is required when OPENROUTER_ENABLED=true")
 	}
 
-	// Start the lightweight tokenizer process (no model, just tokenizer)
+	// Start the lightweight tokenizer process (no model, just tokenizer).
+	// Use a separate tokenizer model if specified; otherwise fall back to
+	// a cached default (gpt2) so we don't require HF downloads at runtime.
+	tokenizerModel := os.Getenv("OPENROUTER_TOKENIZER_MODEL")
+	if tokenizerModel == "" {
+		tokenizerModel = cfg.Model
+	}
 	tokenizer, err := conversationstenography.NewPythonTokenizer(
 		ctx,
 		getPython(),
-		cfg.Model,
+		tokenizerModel,
 		os.Getenv("OPENROUTER_TOKENIZER_REVISION"),
 	)
+	if err != nil {
+		// Tokenizer is optional — without it, Tokenize/Detokenize will fail
+		// with a clear error at call time.
+		fmt.Printf("   ⚠ Tokenizer init failed: %v\n", err)
+		fmt.Printf("   → Tokenize/Detokenize unavailable, set OPENROUTER_TOKENIZER_MODEL\n")
+		return conversationstenography.NewOpenRouterModel(cfg, nil), nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("start tokenizer: %w", err)
 	}
