@@ -8,7 +8,15 @@ Conversation Stenography lets two people have a completely private conversation 
 
 - Governments are moving toward scanning private messages
 - Sending normal encrypted messages is risky because it might flag you on basis of suspicioun 
-- Today it's "just CSAM." Tomorrow god knows what
+
+personal note:  I’m 18, and I’m definitely not the first person to explore this idea. LLM-based steganography has existed for years, even GPT-2, the local model used by this project, was released in 2019. People far capable than me have likely been experimenting with techniques like this for a long time. This project simply demonstrates a practical use case for LLMs that may already be operating at scale.
+
+> [!CAUTION]
+> **Educational Use Only**
+> This project is provided for educational and research purposes. Engaging in any unauthorized or illegal activities is strictly prohibited. The creator assumes no liability for any misuse.
+
+> [!WARNING]
+> This is a proof of concept and still has multiple issues. There are several techniques being already developed to figure out if a text has hidden content. 
 
 > **Example:** You type `"meet me at the coffee shop at 3pm"` and Conversation Stenography generates something like `"Hey, I was just thinking about that recipe you mentioned. It sounds amazing, especially the part about the fresh basil."` which is what gets sent in your chat app. Your friend's Conversation Stenography decodes it back to `"meet me at the coffee shop at 3pm"`.
 
@@ -17,13 +25,7 @@ Conversation Stenography lets two people have a completely private conversation 
 
 **Your actual messages never leave your device unencrypted.** The messaging platform only ever sees innocent cover text.
 
-> [!CAUTION]
-> **Educational Use Only**
-> This project is provided for educational and research purposes. Engaging in any unauthorized or illegal activities is strictly prohibited. The creator assumes no liability for any misuse.
 
-
-> [!WARNING]
-> This is a proof of concept and still has multiple issues
 
 
 ## Quick Start
