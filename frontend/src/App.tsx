@@ -5,6 +5,9 @@ import { Button } from "./components/ui/button"
 import { Badge } from "./components/ui/badge"
 import { ScrollArea } from "./components/ui/scroll-area"
 import { Textarea } from "./components/ui/textarea"
+import { Input } from "./components/ui/input"
+import { Slider } from "./components/ui/slider"
+import { Alert, AlertTitle, AlertDescription } from "./components/ui/alert"
 
 type ConsoleEntry = {
   t: string
@@ -23,135 +26,84 @@ type SetupMode = "phrase" | "invite"
 
 const API = "/api/v1"
 
-/* ─── Helper: generate 32 random bytes as hex ─── */
 function generateToken(): string {
   const buf = new Uint8Array(32)
   crypto.getRandomValues(buf)
   return Array.from(buf).map((b) => b.toString(16).padStart(2, "0")).join("")
 }
 
-/* ─── Helper: read token from URL fragment ─── */
 function getTokenFromHash(): string | null {
   const hash = window.location.hash
   if (!hash || hash === "#") return null
-  return hash.slice(1) // strip leading #
+  return hash.slice(1)
 }
 
-/* ─── Helper: session ID source ─── */
 function getSessionId(): string | null {
   const m = document.cookie.match(/(?:^|;\s*)steg_session_id=([^;]*)/)
   return m ? m[1] : null
 }
 
-/* ─── Helper: remove hash without page reload ─── */
 function clearHash() {
   history.replaceState(null, "", window.location.pathname)
 }
 
 export default function App() {
-  // ── Core state ──
   const [tab, setTab] = useState("setup")
   const [consoleEntries, setConsoleEntries] = useState<ConsoleEntry[]>([])
   const [status, setStatus] = useState<SessionStatus | null>(null)
   const [loading, setLoading] = useState(false)
 
-  // ── Session mode ──
   const [setupMode, setSetupMode] = useState<SetupMode>("phrase")
-
-  // Phrase mode state
   const [conversationName, setConversationName] = useState("")
   const [secretPhrase, setSecretPhrase] = useState("")
-
-  // Invite mode state
   const [inviteTopic, setInviteTopic] = useState("")
-  const [inviteDuration, setInviteDuration] = useState(15) // minutes
+  const [inviteDuration, setInviteDuration] = useState(15)
   const [inviteToken, setInviteToken] = useState<string | null>(null)
   const [inviteURL, setInviteURL] = useState("")
 
-  // Active token (invite mode) — stored outside state to avoid re-renders on fetch
   const activeTokenRef = useRef<string | null>(null)
-
-  // Encode / decode state
   const [plaintext, setPlaintext] = useState("")
   const [coverText, setCoverText] = useState("")
   const [decodeInput, setDecodeInput] = useState("")
   const [decodedText, setDecodedText] = useState("")
-
-  // SSE ref
   const eventSourceRef = useRef<EventSource | null>(null)
-
-  // Console scroll ref
   const consoleRef = useRef<HTMLDivElement>(null)
 
-  /* ─── Check for invite token in URL on mount ─── */
   useEffect(() => {
     const hashToken = getTokenFromHash()
     if (hashToken && hashToken.length >= 32) {
       activeTokenRef.current = hashToken
       setTab("encode")
-      setupSSE(hashToken)
       fetchStatus(hashToken)
     }
   }, [])
 
-  /* ─── Fetch session status ─── */
   const fetchStatus = useCallback(async (overrideToken?: string) => {
     const token = overrideToken || activeTokenRef.current
     const sid = getSessionId()
     if (!sid && !token) return
-
     const headers: Record<string, string> = {}
     if (token) headers["X-Session-Token"] = token
-
     try {
       const res = await fetch(`${API}/session/status`, { headers })
       const data: SessionStatus = await res.json()
       setStatus(data)
-      if (!data.alive) {
-        setConsoleEntries([])
-        eventSourceRef.current?.close()
-      }
+      if (!data.alive) { setConsoleEntries([]); eventSourceRef.current?.close() }
     } catch { /* ignore */ }
   }, [])
 
-  /* ─── SSE for transparency console ─── */
-  const setupSSE = useCallback((token?: string) => {
-    eventSourceRef.current?.close()
-    const headers: Record<string, string> = {}
-    if (token) headers["X-Session-Token"] = token
-
-    // SSE via EventSource doesn't support custom headers natively.
-    // For invite mode we use cookie-less flow; a polyfill would be needed
-    // for true header support. As a pragmatic approach, we poll status.
-    // (EventSource with custom headers requires a polyfill like event-source-polyfill)
-    if (token) return // invite mode: SSE skipped for now
-
-    const es = new EventSource(`${API}/events`, { withCredentials: true })
-    es.onmessage = (evt) => {
-      try {
-        setConsoleEntries((prev) => [...prev, JSON.parse(evt.data)])
-      } catch { /* ignore */ }
-    }
-    eventSourceRef.current = es
-  }, [])
-
-  /* ─── Auto-scroll console ─── */
-  useEffect(() => {
-    if (consoleRef.current)
-      consoleRef.current.scrollTop = consoleRef.current.scrollHeight
-  }, [consoleEntries])
-
-  /* ─── Periodic status poll (replaces SSE for invite mode) ─── */
   useEffect(() => {
     if (!activeTokenRef.current) return
     const interval = setInterval(() => fetchStatus(activeTokenRef.current ?? undefined), 5000)
     return () => clearInterval(interval)
   }, [fetchStatus])
 
-  /* ─── Create phrase session ─── */
+  useEffect(() => {
+    if (consoleRef.current) consoleRef.current.scrollTop = consoleRef.current.scrollHeight
+  }, [consoleEntries])
+
   const handleStartPhrase = async () => {
-    if (!conversationName || !secretPhrase) return
-    setLoading(true)
+    if (!conversationName || !secretPhrase) return; setLoading(true)
     try {
       const res = await fetch(`${API}/session/start`, {
         method: "POST",
@@ -161,19 +113,13 @@ export default function App() {
       const data = await res.json()
       if (data.error) { alert(data.error); return }
       if (data.audit_events) setConsoleEntries(data.audit_events)
-      setSecretPhrase("")
-      setTab("encode")
-      setupSSE()
-      fetchStatus()
+      setSecretPhrase(""); setTab("encode"); fetchStatus()
     } catch { alert("Failed to start session") }
     finally { setLoading(false) }
   }
 
-  /* ─── Create invite session ─── */
   const handleCreateInvite = async () => {
-    if (!inviteTopic) return
-    setLoading(true)
-    const token = generateToken()
+    if (!inviteTopic) return; setLoading(true); const token = generateToken()
     try {
       const res = await fetch(`${API}/session/invite`, {
         method: "POST",
@@ -182,88 +128,58 @@ export default function App() {
       })
       const data = await res.json()
       if (data.error) { alert(data.error); return }
-
-      activeTokenRef.current = token
-      setInviteToken(token)
-      const url = `${window.location.origin}/#${token}`
-      setInviteURL(url)
-
+      activeTokenRef.current = token; setInviteToken(token)
+      const url = `${window.location.origin}/#${token}`; setInviteURL(url)
       if (data.audit_events) setConsoleEntries(data.audit_events)
-
-      // Auto-navigate to invite URL (pushState to keep fragment)
-      history.pushState(null, "", `/#${token}`)
-      setTab("encode")
-      fetchStatus(token)
+      history.pushState(null, "", `/#${token}`); setTab("encode"); fetchStatus(token)
     } catch { alert("Failed to create invite") }
     finally { setLoading(false) }
   }
 
-  /* ─── Encode ─── */
   const handleEncode = async () => {
-    if (!plaintext) return
-    setLoading(true)
-
+    if (!plaintext) return; setLoading(true)
     const headers: Record<string, string> = { "Content-Type": "application/json" }
     if (activeTokenRef.current) headers["X-Session-Token"] = activeTokenRef.current
-
     try {
       const res = await fetch(`${API}/message/encode`, { method: "POST", headers, body: JSON.stringify({ plaintext }) })
       const data = await res.json()
       if (data.error) { alert(data.error); return }
       setCoverText(data.cover_text)
-      if (data.audit_events) setConsoleEntries((prev) => [...prev, ...data.audit_events])
+      if (data.audit_events) setConsoleEntries((p) => [...p, ...data.audit_events])
       fetchStatus()
     } catch { alert("Encoding failed") }
     finally { setLoading(false) }
   }
 
-  /* ─── Decode ─── */
   const handleDecode = async () => {
-    if (!decodeInput) return
-    setLoading(true)
-
+    if (!decodeInput) return; setLoading(true)
     const headers: Record<string, string> = { "Content-Type": "application/json" }
     if (activeTokenRef.current) headers["X-Session-Token"] = activeTokenRef.current
-
     try {
       const res = await fetch(`${API}/message/decode`, { method: "POST", headers, body: JSON.stringify({ cover_text: decodeInput, sender: "remote" }) })
       const data = await res.json()
       if (data.error) { alert(data.error); return }
       setDecodedText(data.plaintext)
-      if (data.audit_events) setConsoleEntries((prev) => [...prev, ...data.audit_events])
+      if (data.audit_events) setConsoleEntries((p) => [...p, ...data.audit_events])
       fetchStatus()
     } catch { alert("Decoding failed") }
     finally { setLoading(false) }
   }
 
-  /* ─── Revoke ─── */
   const handleRevoke = async () => {
     const headers: Record<string, string> = {}
     if (activeTokenRef.current) headers["X-Session-Token"] = activeTokenRef.current
     try {
       const res = await fetch(`${API}/session/revoke`, { method: "POST", headers })
       const data = await res.json()
-      if (data.audit_events) setConsoleEntries((prev) => [...prev, ...data.audit_events])
+      if (data.audit_events) setConsoleEntries((p) => [...p, ...data.audit_events])
     } catch { /* ignore */ }
-
-    activeTokenRef.current = null
-    setInviteToken(null)
-    setInviteURL("")
-    setStatus(null)
-    setCoverText("")
-    setDecodedText("")
-    clearHash()
-    eventSourceRef.current?.close()
-    setTab("setup")
+    activeTokenRef.current = null; setInviteToken(null); setInviteURL("")
+    setStatus(null); setCoverText(""); setDecodedText("")
+    clearHash(); eventSourceRef.current?.close(); setTab("setup")
     setTimeout(() => setConsoleEntries([]), 100)
   }
 
-  /* ─── Copy invite URL ─── */
-  const copyInviteURL = () => {
-    navigator.clipboard.writeText(inviteURL)
-  }
-
-  // ── Derived state ──
   const isSessionAlive = status?.alive === true
   const remaining = status?.remaining_seconds ?? 0
   const isFixed = status?.ttl_mode === "fixed"
@@ -299,79 +215,47 @@ export default function App() {
           </TabsList>
 
           <TabsContent value="setup" className="space-y-4">
-            {/* Setup method toggle */}
-            <div className="flex gap-2 bg-muted p-1 rounded-lg">
-              <button
-                onClick={() => setSetupMode("phrase")}
-                className={`flex-1 py-1.5 px-3 rounded-md text-sm font-medium transition-all ${
-                  setupMode === "phrase" ? "bg-white text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                Secret Phrase
-              </button>
-              <button
-                onClick={() => setSetupMode("invite")}
-                className={`flex-1 py-1.5 px-3 rounded-md text-sm font-medium transition-all ${
-                  setupMode === "invite" ? "bg-white text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                Invite Link
-              </button>
-            </div>
+            {/* shadcn Tabs as setup mode toggle */}
+            <Tabs value={setupMode} onValueChange={(v) => setSetupMode(v as SetupMode)} className="w-full">
+              <TabsList className="grid grid-cols-2 w-full">
+                <TabsTrigger value="phrase">Secret Phrase</TabsTrigger>
+                <TabsTrigger value="invite">Invite Link</TabsTrigger>
+              </TabsList>
+            </Tabs>
 
             {setupMode === "phrase" ? (
-              /* ─── Phrase mode ─── */
-              <div className="space-y-4">
+              <div className="space-y-4 pt-2">
                 <div className="space-y-2">
                   <label className="text-sm font-medium">Conversation name</label>
-                  <input
-                    className="flex h-10 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
-                    placeholder="e.g., secure-chat-01"
-                    value={conversationName}
-                    onChange={(e) => setConversationName(e.target.value)}
-                  />
+                  <Input placeholder="e.g., secure-chat-01" value={conversationName} onChange={(e) => setConversationName(e.target.value)} />
                 </div>
                 <div className="space-y-2">
                   <label className="text-sm font-medium">Secret phrase (min 16 chars)</label>
-                  <input
-                    type="password"
-                    className="flex h-10 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
-                    placeholder="••••••••••••••••"
-                    value={secretPhrase}
-                    onChange={(e) => setSecretPhrase(e.target.value)}
-                  />
+                  <Input type="password" placeholder="••••••••••••••••" value={secretPhrase} onChange={(e) => setSecretPhrase(e.target.value)} />
                 </div>
                 <Button className="w-full" onClick={handleStartPhrase} disabled={loading || conversationName.length === 0 || secretPhrase.length < 16}>
-                  {loading ? "Starting…" : "Start Secure Session"}
+                  {loading ? "Starting..." : "Start Secure Session"}
                 </Button>
               </div>
             ) : (
-              /* ─── Invite mode ─── */
-              <div className="space-y-4">
+              <div className="space-y-4 pt-2">
                 <div className="space-y-2">
                   <label className="text-sm font-medium">Topic</label>
-                  <input
-                    className="flex h-10 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
-                    placeholder="e.g., project-alpha"
-                    value={inviteTopic}
-                    onChange={(e) => setInviteTopic(e.target.value)}
-                  />
+                  <Input placeholder="e.g., project-alpha" value={inviteTopic} onChange={(e) => setInviteTopic(e.target.value)} />
                 </div>
 
-                <div className="space-y-2">
+                <div className="space-y-3">
                   <label className="text-sm font-medium">
                     Link lifetime: <span className="font-mono">{inviteDuration} min</span>
                   </label>
-                  <input
-                    type="range"
+                  <Slider
+                    value={[inviteDuration]}
+                    onValueChange={([v]) => setInviteDuration(v)}
                     min={1}
                     max={120}
                     step={1}
-                    className="w-full accent-[hsl(142,76%,36%)]"
-                    value={inviteDuration}
-                    onChange={(e) => setInviteDuration(Number(e.target.value))}
                   />
-                  <div className="flex justify-between text-[10px] text-muted-foreground">
+                  <div className="flex justify-between text-[10px] text-muted-foreground px-0.5">
                     <span>1 min</span>
                     <span>60 min</span>
                     <span>120 min</span>
@@ -380,52 +264,34 @@ export default function App() {
 
                 {!inviteURL ? (
                   <Button className="w-full" onClick={handleCreateInvite} disabled={loading || !inviteTopic}>
-                    {loading ? "Creating…" : "Generate Invite Link"}
+                    {loading ? "Creating..." : "Generate Invite Link"}
                   </Button>
                 ) : (
                   <div className="space-y-4">
-                    {/* Invite link display */}
                     <div className="space-y-2">
                       <label className="text-sm font-medium">Invite link</label>
                       <div className="flex gap-2">
                         <code className="flex-1 p-3 rounded-lg bg-muted border text-xs font-mono break-all select-all">
                           {inviteURL}
                         </code>
-                        <Button variant="secondary" onClick={copyInviteURL} className="shrink-0">
+                        <Button variant="secondary" onClick={() => navigator.clipboard.writeText(inviteURL)} className="shrink-0">
                           Copy
                         </Button>
                       </div>
                     </div>
 
-                    {/* ⚠ Warning */}
-                    <div className="p-3 rounded-lg border border-amber-200 bg-amber-50 text-amber-800 text-xs leading-relaxed">
-                      <strong className="block mb-1">⚠ Security warning</strong>
-                      Do <em>not</em> send this invite link through the same messaging channel where you will exchange cover texts.
-                      If an attacker obtains both the link and the cover texts, the encryption is bypassed.
-                      Share the link through a different channel (e.g., link in Signal, chat in Telegram).
-                    </div>
+                    <Alert variant="warning">
+                      <AlertTitle>Security warning</AlertTitle>
+                      <AlertDescription>
+                        Do <em>not</em> send this invite link through the same messaging channel where you will exchange cover texts.
+                        If an attacker obtains both the link and the cover texts, the encryption is bypassed.
+                        Share the link through a different channel (e.g., link in Signal, chat in Telegram).
+                      </AlertDescription>
+                    </Alert>
 
                     <div className="flex gap-2">
-                      <Button
-                        className="flex-1"
-                        onClick={() => {
-                          setTab("encode")
-                        }}
-                      >
-                        Go to Encode
-                      </Button>
-                      <Button
-                        variant="outline"
-                        className="flex-1"
-                        onClick={() => {
-                          setInviteURL("")
-                          setInviteToken(null)
-                          activeTokenRef.current = null
-                          clearHash()
-                        }}
-                      >
-                        New Link
-                      </Button>
+                      <Button className="flex-1" onClick={() => setTab("encode")}>Go to Encode</Button>
+                      <Button variant="outline" className="flex-1" onClick={() => { setInviteURL(""); setInviteToken(null); activeTokenRef.current = null; clearHash() }}>New Link</Button>
                     </div>
                   </div>
                 )}
@@ -447,10 +313,10 @@ export default function App() {
               <>
                 <div className="space-y-2">
                   <label className="text-sm font-medium">Your message</label>
-                  <Textarea placeholder="Type your secret message here…" value={plaintext} onChange={(e) => setPlaintext(e.target.value)} />
+                  <Textarea placeholder="Type your secret message here..." value={plaintext} onChange={(e) => setPlaintext(e.target.value)} />
                 </div>
                 <Button className="w-full" onClick={handleEncode} disabled={loading || !plaintext}>
-                  {loading ? "Generating…" : "Generate Cover Text"}
+                  {loading ? "Generating..." : "Generate Cover Text"}
                 </Button>
                 {coverText && (
                   <div className="space-y-2">
@@ -475,15 +341,15 @@ export default function App() {
               <>
                 <div className="space-y-2">
                   <label className="text-sm font-medium">Paste cover text</label>
-                  <Textarea placeholder="Paste the received cover text here…" value={decodeInput} onChange={(e) => setDecodeInput(e.target.value)} />
+                  <Textarea placeholder="Paste the received cover text here..." value={decodeInput} onChange={(e) => setDecodeInput(e.target.value)} />
                 </div>
                 <Button className="w-full" onClick={handleDecode} disabled={loading || !decodeInput}>
-                  {loading ? "Decoding…" : "Decode Message"}
+                  {loading ? "Decoding..." : "Decode Message"}
                 </Button>
                 {decodedText && (
                   <div className="space-y-2">
                     <label className="text-sm font-medium">Decrypted message</label>
-                    <div className="p-4 rounded-lg bg-[hsl(142,30%,94%)] border border-[hsl(142,20%,85%)]">
+                    <div className="p-4 rounded-lg bg-green-50 border border-green-200">
                       <p className="text-sm">{decodedText}</p>
                     </div>
                   </div>
@@ -493,7 +359,6 @@ export default function App() {
           </TabsContent>
         </Tabs>
 
-        {/* Session footer */}
         {isSessionAlive && (
           <div className="px-6 pb-4 flex justify-between items-center">
             <div className="flex gap-2">
@@ -520,7 +385,7 @@ export default function App() {
             <span className="text-[10px] font-mono uppercase tracking-wider text-[#666]">Transparency Console</span>
             <span className="flex items-center gap-1.5">
               {isSessionAlive && (
-                <span className={`w-1.5 h-1.5 rounded-full ${isFixed ? "bg-amber-500" : "bg-[hsl(142,70%,45%)]"} animate-pulse`} />
+                <span className={`w-1.5 h-1.5 rounded-full animate-pulse ${isFixed ? "bg-amber-500" : "bg-[hsl(142,70%,45%)]"}`} />
               )}
               <span className="text-[10px] font-mono text-[#555]">
                 {isSessionAlive ? (isFixed ? "INVITE" : "LIVE") : "INACTIVE"}
@@ -530,10 +395,10 @@ export default function App() {
           <ScrollArea className="h-48">
             <div ref={consoleRef} className="p-3 font-mono text-[11px] leading-relaxed space-y-1">
               {consoleEntries.length === 0 ? (
-                <p className="text-[#444] italic">Waiting for events…</p>
+                <p className="text-[#444] italic">Waiting for events...</p>
               ) : (
                 consoleEntries.map((entry, i) => (
-                  <div key={i} className="animate-in fade-in duration-300">
+                  <div key={i} className="animate-in slide-in-from-bottom-1 fade-in duration-200">
                     <span className="text-[#555]">{entry.t ? entry.t.slice(11, 19) : ""}</span>{" "}
                     <span className={entry.type === "security" || entry.type === "wipe" ? "text-[hsl(142,60%,50%)]" : "text-[#ccc]"}>
                       {entry.m}
