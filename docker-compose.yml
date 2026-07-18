@@ -2,9 +2,6 @@ version: "3.8"
 
 services:
   steganography:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: ghcr.io/graf4ik322/conversation-steganography:latest
     container_name: steganography
     restart: unless-stopped
@@ -15,23 +12,26 @@ services:
       # === Session ===
       - SESSION_SLIDING_TTL=15m
       - SESSION_MAX_TTL=12h
-      # === Model Backend (pick one) ===
-      # OpenRouter mode (no local GPU needed):
-      - OPENROUTER_ENABLED=false
-      - OPENROUTER_API_KEY=
+      # === Model Backend ===
+      # OpenRouter mode (рекомендуется — лёгкий, без GPU):
+      - OPENROUTER_ENABLED=true
+      - OPENROUTER_API_KEY=sk-or-v1-...
       - OPENROUTER_MODEL=meta-llama/llama-3.2-3b-instruct
-      # Local mode (needs more RAM/CPU):
-      - LOCAL_MODEL=openai-community/gpt2
-      - LOCAL_DEVICE=cpu
-      # === Generative tuning ===
+      # Если токенайзер отличается от модели (редко):
+      # - OPENROUTER_TOKENIZER_MODEL=
+      # Локальная модель (нужен PyTorch ~3GB):
+      # - OPENROUTER_ENABLED=false
+      # - LOCAL_MODEL=openai-community/gpt2
+      # - LOCAL_DEVICE=cpu
+      # === Generative ===
       - TOP_N=5
       - TEMPERATURE=0.7
       - FINISH_TOKENS=10
       - CANDIDATE_POOL=20
       - CARRIER_TRIALS=3
-    # Optional: mount model cache for local mode
+    # Для локальной модели — кэш HuggingFace:
     # volumes:
-    #   - model-cache:/root/.cache/huggingface
+    #   - hf-cache:/root/.cache/huggingface
 
 # volumes:
-#   model-cache:
+#   hf-cache:
