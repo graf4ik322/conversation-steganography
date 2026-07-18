@@ -38,13 +38,21 @@ func run() error {
 	ctx := context.Background()
 	model, err := factory.CreateModel(ctx)
 	if err != nil {
-		return fmt.Errorf("create model: %w", err)
+		fmt.Printf("   ⚠ Model init failed: %v\n", err)
+		fmt.Printf("   → API will return errors until a model is available\n")
+	} else {
+		defer func() {
+			if closer, ok := model.(interface{ Close() error }); ok {
+				closer.Close()
+			}
+		}()
 	}
-	defer func() {
-		if closer, ok := model.(interface{ Close() error }); ok {
-			closer.Close()
-		}
-	}()
+	_ = model // may be nil; handlers check model availability
+
+	var fingerprint string
+	if model != nil {
+		fingerprint = model.Fingerprint()
+	}
 
 	cfg := &conversationstenography.GenerativeConfig{
 		Prompt:           getEnvOrDefault("PROMPT", "Continue this casual chat message naturally"),
@@ -54,13 +62,15 @@ func run() error {
 		CandidatePool:    parseIntOrDefault("CANDIDATE_POOL", 20),
 		CarrierTrials:    parseIntOrDefault("CARRIER_TRIALS", 3),
 		NaturalnessSlack: parseFloatOrDefault("NATURALNESS_SLACK", 0.3),
-		ModelFingerprint: model.Fingerprint(),
+		ModelFingerprint: fingerprint,
 	}
 
 	sm := NewSessionManager(slidingTTL, maxTTL)
 	h := NewHandler(sm, model, cfg)
 
 	mux := http.NewServeMux()
+
+	// API routes
 	mux.HandleFunc("/api/v1/session/start", h.handleSessionStart)
 	mux.HandleFunc("/api/v1/session/status", h.handleSessionStatus)
 	mux.HandleFunc("/api/v1/message/encode", h.handleEncode)
@@ -71,6 +81,16 @@ func run() error {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok"}`))
 	})
+
+	// Serve frontend static files (SPA)
+	staticDir := getEnvOrDefault("STATIC_DIR", "frontend/dist")
+	if info, err := os.Stat(staticDir); err == nil && info.IsDir() {
+		fs := http.FileServer(http.Dir(staticDir))
+		mux.Handle("/", fs)
+		fmt.Printf("   Static files: %s\n", staticDir)
+	} else {
+		fmt.Printf("   Static files: not found (%s), API-only mode\n", staticDir)
+	}
 
 	handler := securityHeaders(mux)
 
