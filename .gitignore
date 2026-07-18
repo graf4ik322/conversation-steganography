@@ -13,3 +13,7 @@ __pycache__/
 /.conversation-stenography-venv/
 /.conversation-stenography-chain.json
 /*.state
+
+# Frontend
+frontend/node_modules/
+frontend/dist/

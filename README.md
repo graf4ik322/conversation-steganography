@@ -323,3 +323,38 @@ go test ./...
 ## License
 
 See [LICENSE](LICENSE) for details.
+
+
+---
+
+## 🌐 Web Service
+
+This fork adds a web service mode. Run:
+
+```bash
+# With local model (default)
+docker compose up
+
+# Or with OpenRouter API
+export OPENROUTER_ENABLED=true
+export OPENROUTER_API_KEY=sk-or-v1-...
+export OPENROUTER_MODEL=meta-llama/llama-3.2-3b-instruct
+go run ./cmd/webserver/
+```
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/v1/session/start` | POST | Create session (conversation + secret phrase) |
+| `/api/v1/session/status` | GET | Session TTL and health |
+| `/api/v1/message/encode` | POST | Plaintext → Cover text |
+| `/api/v1/message/decode` | POST | Cover text → Plaintext |
+| `/api/v1/session/revoke` | POST | Wipe session immediately |
+| `/api/v1/events` | GET | SSE transparency console stream |
+
+### Frontend
+
+```bash
+cd frontend && npm install && npm run dev
+```
