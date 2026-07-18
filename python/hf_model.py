@@ -45,7 +45,7 @@ def main():
     import transformers
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    torch.use_deterministic_algorithms(True)
+    torch.use_deterministic_algorithms(True, warn_only=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
     dtype = getattr(torch, args.dtype)
     model = AutoModelForCausalLM.from_pretrained(args.model, revision=args.revision, torch_dtype=dtype)
@@ -96,7 +96,7 @@ def main():
                 if not ids:
                     raise ValueError("model context cannot be empty")
                 input_ids = torch.tensor([ids], device=args.device)
-                with torch.inference_mode():
+                with torch.no_grad():
                     logits = model(input_ids=input_ids).logits[0, -1].float()
                 if special:
                     logits[list(special)] = -torch.inf

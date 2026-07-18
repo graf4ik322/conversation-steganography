@@ -321,11 +321,41 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) encodeMessage(ctx context.Context, s *Session, plaintext string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return fmt.Sprintf("[encoded:%d]", len(plaintext)), nil
+
+	// 1. Authenticated encryption (AES-GCM)
+	payload, err := conversationstenography.SealCarrierPayload(
+		s.key, s.id, "encode", 1, []byte(plaintext),
+	)
+	if err != nil {
+		return "", fmt.Errorf("encrypt: %w", err)
+	}
+
+	// 2. Generative embedding (model → cover text)
+	coverText, err := s.codec.Encode(ctx, payload)
+	if err != nil {
+		return "", fmt.Errorf("encode: %w", err)
+	}
+
+	return coverText, nil
 }
 
 func (h *Handler) decodeMessage(ctx context.Context, s *Session, coverText string, sender string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return fmt.Sprintf("[decoded from %s]", sender), nil
+
+	// 1. Extract payload from cover text
+	payload, err := s.codec.Decode(ctx, coverText)
+	if err != nil {
+		return "", fmt.Errorf("decode: %w", err)
+	}
+
+	// 2. Decrypt and verify (same AAD as encode)
+	plainBytes, err := conversationstenography.OpenCarrierPayload(
+		s.key, s.id, "encode", 1, payload,
+	)
+	if err != nil {
+		return "", fmt.Errorf("decrypt: %w", err)
+	}
+
+	return string(plainBytes), nil
 }

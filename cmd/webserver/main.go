@@ -98,7 +98,7 @@ func run() error {
 		Addr:         ":" + port,
 		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
+		WriteTimeout: 300 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 
