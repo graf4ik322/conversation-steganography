@@ -228,6 +228,7 @@ func (sm *SessionManager) CreateInviteSession(
 
 	s := &Session{
 		id:        token,
+		key:       []byte(token), // token itself is the key material (32+ bytes entropy)
 		config:    config,
 		model:     model,
 		codec:     codec,
