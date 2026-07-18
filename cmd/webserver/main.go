@@ -72,6 +72,7 @@ func run() error {
 
 	// API routes
 	mux.HandleFunc("/api/v1/session/start", h.handleSessionStart)
+	mux.HandleFunc("/api/v1/session/invite", h.handleInviteSession)
 	mux.HandleFunc("/api/v1/session/status", h.handleSessionStatus)
 	mux.HandleFunc("/api/v1/message/encode", h.handleEncode)
 	mux.HandleFunc("/api/v1/message/decode", h.handleDecode)

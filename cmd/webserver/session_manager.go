@@ -19,6 +19,14 @@ type AuditEvent struct {
 	Type      string    `json:"type,omitempty"` // "info", "security", "wipe"
 }
 
+// TTLMode defines the session timeout policy.
+type TTLMode int
+
+const (
+	TTLModeSliding TTLMode = iota // extended on each encode/decode
+	TTLModeFixed                  // fixed window, never extended
+)
+
 // Session holds all per-conversation state with isolated lifecycle.
 type Session struct {
 	id         string
@@ -28,7 +36,8 @@ type Session struct {
 	codec      *conversationstenography.GenerativeCodec
 	chain      *conversationstenography.ConversationChain
 	created    time.Time
-	expiresAt  time.Time // hard cap
+	expiresAt  time.Time // hard cap / fixed TTL expiry
+	ttlMode    TTLMode   // sliding or fixed
 	slidingTTL time.Duration
 	alive      bool
 	timer      *time.Timer
@@ -103,6 +112,7 @@ func (sm *SessionManager) CreateSession(
 		codec:      codec,
 		created:    time.Now(),
 		expiresAt:  time.Now().Add(sm.maxTTL),
+		ttlMode:    TTLModeSliding,
 		slidingTTL: sm.ttl,
 		alive:      true,
 		consoleCh:  make(chan AuditEvent, 64),
@@ -141,8 +151,10 @@ func (sm *SessionManager) GetSession(id string) *Session {
 		return nil
 	}
 
-	// Reset sliding TTL timer
-	s.timer.Reset(sm.ttl)
+	// Reset sliding TTL timer (only for sliding mode)
+	if s.ttlMode == TTLModeSliding {
+		s.timer.Reset(sm.ttl)
+	}
 
 	return s
 }
@@ -193,6 +205,54 @@ func (sm *SessionManager) wipeSessionLocked(id string) []AuditEvent {
 
 	delete(sm.sessions, id)
 	return events
+}
+
+// CreateInviteSession creates a session with a client-generated token and fixed TTL.
+// Unlike CreateSession, there is no key derivation — the token IS the identifier.
+// The session lives exactly `duration` minutes and is NOT extended by activity.
+func (sm *SessionManager) CreateInviteSession(
+	token string,
+	topic string,
+	duration time.Duration,
+	model conversationstenography.LanguageModel,
+	config *conversationstenography.GenerativeConfig,
+) (_ *Session, auditEvents []AuditEvent, err error) {
+	if len(token) < 32 {
+		return nil, nil, fmt.Errorf("token must be at least 32 bytes of entropy")
+	}
+
+	codec, err := conversationstenography.NewGenerativeCodec(model, *config)
+	if err != nil {
+		return nil, nil, fmt.Errorf("codec init: %w", err)
+	}
+
+	s := &Session{
+		id:        token,
+		config:    config,
+		model:     model,
+		codec:     codec,
+		created:   time.Now(),
+		expiresAt: time.Now().Add(duration),
+		ttlMode:   TTLModeFixed,
+		alive:     true,
+		consoleCh: make(chan AuditEvent, 64),
+	}
+
+	// Fixed timer — no sliding, hard wipe at the end
+	s.timer = time.AfterFunc(duration, func() {
+		sm.wipeSession(token)
+	})
+
+	sm.mu.Lock()
+	sm.sessions[token] = s
+	sm.mu.Unlock()
+
+	events := []AuditEvent{
+		{Timestamp: time.Now(), Message: "Invite session created, fixed TTL: " + duration.String(), Type: "info"},
+		{Timestamp: time.Now(), Message: "Token will be hard-wiped on expiry — forward secrecy active", Type: "security"},
+	}
+
+	return s, events, nil
 }
 
 // SessionCount returns the number of active sessions.

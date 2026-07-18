@@ -39,11 +39,24 @@ type sessionStartResponse struct {
 	Error       string       `json:"error,omitempty"`
 }
 
+type inviteSessionRequest struct {
+	Token           string `json:"token"`
+	Topic           string `json:"topic"`
+	DurationMinutes int    `json:"duration_minutes"`
+}
+
+type inviteSessionResponse struct {
+	InviteURL   string       `json:"invite_url,omitempty"`
+	AuditEvents []AuditEvent `json:"audit_events,omitempty"`
+	Error       string       `json:"error,omitempty"`
+}
+
 type statusResponse struct {
-	Alive            bool `json:"alive"`
-	TTLSeconds       int  `json:"ttl_seconds,omitempty"`
-	RemainingSeconds int  `json:"remaining_seconds,omitempty"`
-	MessageCount     int  `json:"message_count,omitempty"`
+	Alive            bool   `json:"alive"`
+	TTLSeconds       int    `json:"ttl_seconds,omitempty"`
+	RemainingSeconds int    `json:"remaining_seconds,omitempty"`
+	MessageCount     int    `json:"message_count,omitempty"`
+	TTLMode          string `json:"ttl_mode,omitempty"` // "sliding" or "fixed"
 }
 
 type encodeRequest struct {
@@ -78,6 +91,11 @@ func securityHeaders(next http.Handler) http.Handler {
 }
 
 func getSessionID(r *http.Request) string {
+	// 1. Check X-Session-Token header (invite mode)
+	if token := r.Header.Get("X-Session-Token"); token != "" {
+		return token
+	}
+	// 2. Check cookie (phrase mode)
 	cookie, err := r.Cookie(sessionCookieName)
 	if err != nil {
 		return ""
@@ -136,6 +154,52 @@ func (h *Handler) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleInviteSession creates a fixed-TTL session from a client-generated token.
+func (h *Handler) handleInviteSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req inviteSessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, inviteSessionResponse{Error: "invalid request body"})
+		return
+	}
+
+	if req.Token == "" || req.Topic == "" {
+		writeJSON(w, http.StatusBadRequest, inviteSessionResponse{Error: "token and topic are required"})
+		return
+	}
+
+	if req.DurationMinutes < 1 || req.DurationMinutes > 1440 {
+		writeJSON(w, http.StatusBadRequest, inviteSessionResponse{Error: "duration must be 1-1440 minutes"})
+		return
+	}
+
+	if len(req.Token) < 32 {
+		writeJSON(w, http.StatusBadRequest, inviteSessionResponse{Error: "token must be at least 32 characters"})
+		return
+	}
+
+	duration := time.Duration(req.DurationMinutes) * time.Minute
+
+	session, auditEvents, err := h.sessions.CreateInviteSession(
+		req.Token, req.Topic, duration, h.model, h.config,
+	)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, inviteSessionResponse{Error: err.Error()})
+		return
+	}
+
+	_ = session // session is identified by the token itself
+
+	writeJSON(w, http.StatusOK, inviteSessionResponse{
+		InviteURL:   "/#" + req.Token,
+		AuditEvents: auditEvents,
+	})
+}
+
 func (h *Handler) handleSessionStatus(w http.ResponseWriter, r *http.Request) {
 	sessionID := getSessionID(r)
 	if sessionID == "" {
@@ -153,10 +217,16 @@ func (h *Handler) handleSessionStatus(w http.ResponseWriter, r *http.Request) {
 	remaining := time.Until(s.expiresAt)
 	s.mu.Unlock()
 
+	ttlMode := "sliding"
+	if s.ttlMode == TTLModeFixed {
+		ttlMode = "fixed"
+	}
+
 	writeJSON(w, http.StatusOK, statusResponse{
 		Alive:            true,
-		TTLSeconds:       int(h.sessions.ttl.Seconds()),
+		TTLSeconds:       int(remaining.Seconds()),
 		RemainingSeconds: int(remaining.Seconds()),
+		TTLMode:          ttlMode,
 	})
 }
 
